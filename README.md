@@ -19,11 +19,11 @@
 
 <hr>
 
-<h3 align="center">Spotify Connect on a jailbroken PS5, playing over your games</h3>
+<h3 align="center">Spotify Connect on a modified PS5, playing over your games</h3>
 
 <hr>
 
-librespot-ps5 turns a jailbroken PS5 into a Spotify Connect speaker. Pick **PS5 Connect** in the Spotify app on your phone and the music plays through the console, and keeps playing while you are in a game.
+librespot-ps5 turns a modified PS5 into a Spotify Connect speaker. Pick **PS5 Connect** in the Spotify app on your phone and the music plays through the console, and keeps playing while you are in a game.
 
 It is built on [librespot](https://github.com/librespot-org/librespot), the open-source Spotify client library. Like Librespot, it needs a Spotify Premium account.
 
@@ -144,5 +144,3 @@ librespot-ps5 is free software under the [GNU General Public License, version 3 
 ## Disclaimer
 
 This project is not affiliated with or endorsed by Spotify or Sony. Using an unofficial client may be against Spotify's terms of use. It does not let you download music and it does not work without Premium.
-
-By Jack ([stupiditytries](https://github.com/stupiditytries)).
