@@ -1,0 +1,33 @@
+[package]
+name = "connect-ps5"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "GPL-3.0-or-later"
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Spotify Connect receiver. No audio backend of its own (the app plays the samples), TLS in
+# pure Rust with bundled root certificates, and a pure-Rust mDNS responder for discovery.
+librespot = { version = "0.8.0", default-features = false, features = ["rustls-tls-webpki-roots", "with-libmdns"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "net"] }
+futures-util = "0.3"
+# For fetching cover pictures through librespot's own HTTP client.
+http = "1"
+bytes = "1"
+log = "0.4"
+sha1 = "0.10"
+hex = "0.4"
+
+[workspace]
+
+# librespot-core with one change: audio key requests are retried (see
+# vendor/librespot-core/src/audio_key.rs) and the saved login is encrypted (cache.rs).
+[patch.crates-io]
+librespot-core = { path = "../vendor/librespot-core" }
+
+[profile.release]
+panic = "abort"
+opt-level = 2

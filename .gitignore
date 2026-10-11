@@ -1,0 +1,13 @@
+# Internal planning notes, research material and local build output
+PLAN.md
+/research/
+/.local/
+/.claude/
+/build/
+/target/
+**/target/
+HANDOFF.md
+BACKGROUND-PLAYBACK.md
+# Saved Spotify logins: never commit these
+credentials.json
+**/pair-cache/
