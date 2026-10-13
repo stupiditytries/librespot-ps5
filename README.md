@@ -145,4 +145,4 @@ librespot-ps5 is free software under the [GNU General Public License, version 3 
 
 This project is not affiliated with or endorsed by Spotify or Sony. Using an unofficial client may be against Spotify's terms of use. It does not let you download music and it does not work without Premium.
 
-Built with Claude :D
+Anthropic's Opus and Sonnet models were used during development.
