@@ -16,19 +16,19 @@ use crate::{Error, FileId, authentication::Credentials, error::ErrorKind};
 const CACHE_LIMITER_POISON_MSG: &str = "cache limiter mutex should not be poisoned";
 
 // ---------------------------------------------------------------------------------------
-// Addition for the PS5 receiver: the saved login is not kept as readable text.
-//
-// The saved login lets whoever holds it use the account. On the console the file sits where
-// anything on the home network can fetch it (the jailbreak's file server asks for no
-// password), so it is encrypted with a key made from a secret the caller provides (there,
-// an identifier of the console itself) and carries a check value. A copy of the file is
-// then of no use on another machine. It does not protect against code running on the same
-// console, which can ask for the same identifier.
+// Saved-login convenience storage. Device identifiers are not a hardware keystore.
+// AEAD plus a random installation key protects a copied blob; privileged local
+// code or a reader with both key material and the device identifier is outside
+// this protection. No credentials are exposed by the app's loopback servers.
 // ---------------------------------------------------------------------------------------
 
 const SEAL_MAGIC: &[u8] = b"LSPS1";
-/// Used when the caller provides no secret: the file is then only obscured.
-const SEAL_FALLBACK: &[u8] = b"spotifyps5 saved login, not tied to a device";
+const SEAL_V2: &[u8] = b"LSPS2";
+const CREDENTIAL_LIMIT:u64=64*1024;
+static STORE_STATUS:std::sync::atomic::AtomicU8=std::sync::atomic::AtomicU8::new(0);
+/// unpaired, remembered, or storage_error; contains no account identifiers.
+pub fn credentials_storage_status()->&'static str{match STORE_STATUS.load(std::sync::atomic::Ordering::Relaxed){1=>"remembered",2=>"storage_error",_=>"unpaired"}}
+fn storage_result(ok:bool){STORE_STATUS.store(if ok{1}else{2},std::sync::atomic::Ordering::Relaxed);}
 
 static SEAL_SECRET: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
@@ -66,7 +66,8 @@ fn seal_stream(secret: &[u8], nonce: &[u8; 16], data: &mut [u8]) {
 
 /// Encrypts `plain` with `secret`: a marker, a random value, the encrypted bytes, and a
 /// check value over all of it.
-pub fn seal(secret: &[u8], plain: &[u8]) -> Vec<u8> {
+#[cfg(test)]
+fn seal_legacy(secret: &[u8], plain: &[u8]) -> Vec<u8> {
     use rand::RngCore;
     let mut nonce = [0u8; 16];
     rand::rng().fill_bytes(&mut nonce);
@@ -83,7 +84,7 @@ pub fn seal(secret: &[u8], plain: &[u8]) -> Vec<u8> {
 
 /// The reverse of [`seal`]. `None` if the bytes were not sealed with this secret or have
 /// been changed.
-pub fn unseal(secret: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
+fn unseal_legacy(secret: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
     let head = SEAL_MAGIC.len() + 16;
     if sealed.len() < head + 20 || !sealed.starts_with(SEAL_MAGIC) {
         return None;
@@ -101,6 +102,64 @@ pub fn unseal(secret: &[u8], sealed: &[u8]) -> Option<Vec<u8>> {
     Some(body)
 }
 
+
+fn aead_key(secret:&[u8])->[u8;32]{use sha2::{Digest,Sha256};let mut h=Sha256::new();h.update(b"librespot-ps5 credentials v2\0");h.update(secret);h.finalize().into()}
+/// Versioned XChaCha20-Poly1305 envelope, header authenticated as associated data.
+pub fn seal(secret:&[u8],plain:&[u8])->Vec<u8>{
+    use chacha20poly1305::{aead::{Aead,Payload},KeyInit,XChaCha20Poly1305,XNonce};use rand::RngCore;
+    let mut nonce=[0u8;24];rand::rng().fill_bytes(&mut nonce);
+    let cipher=XChaCha20Poly1305::new_from_slice(&aead_key(secret)).expect("fixed key size");
+    let encrypted=cipher.encrypt(XNonce::from_slice(&nonce),Payload{msg:plain,aad:SEAL_V2}).expect("bounded credential plaintext");
+    [SEAL_V2,&nonce,&encrypted].concat()
+}
+pub fn unseal(secret:&[u8],sealed:&[u8])->Option<Vec<u8>>{
+    use chacha20poly1305::{aead::{Aead,Payload},KeyInit,XChaCha20Poly1305,XNonce};
+    if sealed.starts_with(SEAL_MAGIC){return unseal_legacy(secret,sealed);}
+    if !sealed.starts_with(SEAL_V2)||sealed.len()<45||sealed.len()>CREDENTIAL_LIMIT as usize{return None;}
+    XChaCha20Poly1305::new_from_slice(&aead_key(secret)).ok()?.decrypt(XNonce::from_slice(&sealed[5..29]),Payload{msg:&sealed[29..],aad:SEAL_V2}).ok()
+}
+fn private_read(path:&Path,limit:u64)->io::Result<Vec<u8>>{
+    let mut options=fs::OpenOptions::new();options.read(true);
+    #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;options.custom_flags(libc::O_NOFOLLOW);}
+    let mut file=options.open(path)?;let meta=file.metadata()?;
+    if !meta.is_file()||meta.len()>limit{return Err(io::Error::other("invalid credential file"));}
+    #[cfg(unix)]{use std::os::unix::fs::PermissionsExt;file.set_permissions(fs::Permissions::from_mode(0o600))?;}
+    let mut bytes=Vec::new();Read::by_ref(&mut file).take(limit+1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64>limit{return Err(io::Error::other("credential file too large"));}Ok(bytes)
+}
+fn private_directory(path:&Path)->io::Result<()>{
+    fs::create_dir_all(path)?;
+    if !fs::symlink_metadata(path)?.is_dir(){return Err(io::Error::other("credential directory is not a directory"));}
+    #[cfg(unix)]{use std::os::unix::fs::PermissionsExt;fs::set_permissions(path,fs::Permissions::from_mode(0o700))?;}
+    Ok(())
+}
+fn private_write(path:&Path,bytes:&[u8])->io::Result<()>{
+    use rand::RngCore;let parent=path.parent().ok_or_else(||io::Error::other("missing credential directory"))?;private_directory(parent)?;
+    if fs::symlink_metadata(path).is_ok_and(|m|!m.is_file()){return Err(io::Error::other("unsafe credential target"));}
+    let mut nonce=[0u8;8];rand::rng().fill_bytes(&mut nonce);let tmp=parent.join(format!(".credentials-{:016x}.tmp",u64::from_ne_bytes(nonce)));
+    let result=(||{let mut options=fs::OpenOptions::new();options.write(true).create_new(true);
+        #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;options.mode(0o600).custom_flags(libc::O_NOFOLLOW);}
+        let mut f=options.open(&tmp)?;f.write_all(bytes)?;f.sync_all()?;drop(f);fs::rename(&tmp,path)?;
+        // Some PS5 filesystems do not support directory fsync. The file was synced before rename.
+        if let Ok(dir)=File::open(parent){let _=dir.sync_all();}Ok(())})();
+    if result.is_err(){let _=fs::remove_file(tmp);}result
+}
+fn store_key(location:&Path,create:bool)->io::Result<Vec<u8>>{
+    use rand::RngCore;use hmac::{Hmac,Mac};
+    let device=SEAL_SECRET.get().filter(|s|s.len()>=16).ok_or_else(||io::Error::other("device binding unavailable"))?;
+    let parent=location.parent().ok_or_else(||io::Error::other("missing credential directory"))?;private_directory(parent)?;
+    let path=parent.join(".credential-key");
+    let random=match private_read(&path,32){Ok(key) if key.len()==32=>key,Ok(_)=>return Err(io::Error::other("invalid installation key")),
+        Err(e) if create&&e.kind()==io::ErrorKind::NotFound=>{
+            let mut key=vec![0u8;32];rand::rng().fill_bytes(&mut key);
+            // Exclusive creation prevents one writer replacing another's key.
+            let mut options=fs::OpenOptions::new();options.write(true).create_new(true);
+            #[cfg(unix)]{use std::os::unix::fs::OpenOptionsExt;options.mode(0o600).custom_flags(libc::O_NOFOLLOW);}
+            match options.open(&path){Ok(mut f)=>{f.write_all(&key)?;f.sync_all()?;key},Err(e) if e.kind()==io::ErrorKind::AlreadyExists=>private_read(&path,32)?,Err(e)=>return Err(e)}
+        },Err(e)=>return Err(e)};
+    if random.len()!=32{return Err(io::Error::other("invalid installation key"));}
+    let mut h=<Hmac<sha2::Sha256> as Mac>::new_from_slice(device).expect("any key size");h.update(b"librespot-ps5 installation key v2\0");h.update(&random);Ok(h.finalize().into_bytes().to_vec())
+}
 #[derive(Debug, Error)]
 pub enum CacheError {
     #[error("audio cache location is not configured")]
@@ -397,63 +456,26 @@ impl Cache {
     }
 
     pub fn credentials(&self) -> Option<Credentials> {
-        let location = self.credentials_location.as_ref()?;
-
-        // This closure is just convencience to enable the question mark operator
-        // PS5 receiver: the file is sealed (see the top of this file). A file in the old
-        // readable form, or one sealed without a device secret (made on a PC), is still
-        // accepted, and is written again sealed for this device.
-        let secret = SEAL_SECRET.get().map(Vec::as_slice);
-        let mut reseal = false;
-        let mut read = || -> Result<Credentials, Error> {
-            let mut file = File::open(location)?;
-            let mut contents = Vec::new();
-            file.read_to_end(&mut contents)?;
-            if contents.starts_with(SEAL_MAGIC) {
-                let plain = secret
-                    .and_then(|secret| unseal(secret, &contents))
-                    .or_else(|| {
-                        reseal = secret.is_some();
-                        unseal(SEAL_FALLBACK, &contents)
-                    })
-                    .ok_or_else(|| Error::unauthenticated("the saved login was sealed on another device"))?;
-                return Ok(serde_json::from_slice(&plain)?);
-            }
-            reseal = true;
-            Ok(serde_json::from_slice(&contents)?)
-        };
-
-        let result = read();
-        match result {
-            Ok(c) => {
-                if reseal {
-                    self.save_credentials(&c);
-                }
-                Some(c)
-            }
-            Err(e) => {
-                // If the file did not exist, the file was probably not written
-                // before. Otherwise, log the error.
-                if e.kind != ErrorKind::NotFound {
-                    warn!("Error reading credentials from cache: {e}");
-                }
-                None
-            }
-        }
+        let location=self.credentials_location.as_ref()?;
+        let result=(||->Result<Credentials,Error>{
+            let contents=private_read(location,CREDENTIAL_LIMIT)?;
+            let plain=if contents.starts_with(SEAL_V2){unseal(&store_key(location,false)?,&contents)}
+                else if contents.starts_with(SEAL_MAGIC){SEAL_SECRET.get().and_then(|secret|unseal_legacy(secret,&contents))}
+                else {None}.ok_or_else(||Error::unauthenticated("saved login could not be unlocked"))?;
+            let c:Credentials=serde_json::from_slice(&plain)?;
+            if c.auth_data.is_empty()||c.username.as_ref().is_none_or(|s|s.is_empty()) {return Err(Error::unauthenticated("saved login is incomplete"));}Ok(c)
+        })();
+        match result{Ok(c)=>{storage_result(true);Some(c)},Err(e)=>{if e.kind!=ErrorKind::NotFound{storage_result(false);warn!("Saved login unavailable; pair again if needed (contents withheld)");}None}}
     }
-
-    pub fn save_credentials(&self, cred: &Credentials) {
-        if let Some(location) = &self.credentials_location {
-            // PS5 receiver: never written as readable text (see the top of this file).
-            let secret = SEAL_SECRET.get().map_or(SEAL_FALLBACK, Vec::as_slice);
-            let result = File::create(location).and_then(|mut file| {
-                let data = serde_json::to_string(cred)?;
-                file.write_all(&seal(secret, data.as_bytes()))
-            });
-
-            if let Err(e) = result {
-                warn!("Cannot save credentials to cache: {e}")
-            }
+    pub fn save_credentials(&self,cred:&Credentials){
+        if let Some(location)=&self.credentials_location{
+            let result=(||->io::Result<()>{
+                if cred.auth_data.is_empty()||cred.username.as_ref().is_none_or(|s|s.is_empty()){return Err(io::Error::other("incomplete reusable login"));}
+                let key=store_key(location,true)?;let data=serde_json::to_vec(cred)?;
+                if data.len()>CREDENTIAL_LIMIT as usize-64{return Err(io::Error::other("credential record too large"));}
+                private_write(location,&seal(&key,&data))
+            })();
+            storage_result(result.is_ok());if result.is_err(){warn!("Could not remember login; current session remains available (contents withheld)");}
         }
     }
 
@@ -556,6 +578,25 @@ mod test {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn legacy_seals_migrate_without_plaintext_or_public_fallback(){
+        let old=seal_legacy(b"a device binding",b"synthetic credential");
+        assert_eq!(unseal(b"a device binding",&old).unwrap(),b"synthetic credential");
+        assert!(unseal(b"wrong device",&old).is_none());
+        let modern=seal(b"a device binding",b"synthetic credential");assert!(modern.starts_with(SEAL_V2));
+        assert!(unseal(b"wrong device",&modern).is_none());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn credential_writes_are_private_and_reject_symlinks(){
+        use std::os::unix::fs::{PermissionsExt,symlink};
+        let root=std::env::temp_dir().join(format!("credential-safety-{}",std::process::id()));let _=fs::remove_dir_all(&root);fs::create_dir(&root).unwrap();
+        let path=root.join("credentials");private_write(&path,b"first").unwrap();private_write(&path,b"second").unwrap();
+        assert_eq!(private_read(&path,32).unwrap(),b"second");assert_eq!(fs::metadata(&path).unwrap().permissions().mode()&0o777,0o600);
+        assert_eq!(fs::metadata(&root).unwrap().permissions().mode()&0o777,0o700);
+        let link=root.join("linked");symlink(&path,&link).unwrap();assert!(private_write(&link,b"overwrite").is_err());assert!(private_read(&link,32).is_err());
+        assert_eq!(fs::read(&path).unwrap(),b"second");assert!(private_read(&path,3).is_err());fs::remove_dir_all(root).unwrap();
+    }
     fn ordered_time(v: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(v)
     }

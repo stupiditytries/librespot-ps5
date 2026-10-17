@@ -2,7 +2,8 @@
 //! real one: it takes a file's size when it opens it, reads about nine seconds ahead of
 //! what is heard, ends a file at the first thing that is not a valid frame, and half a
 //! second later starts the folder again from its first file. A file with next to no audio
-//! is not played, and the player stops there.
+//! is not played, and the player stops there. When it starts a file the console puts up a
+//! notice whose size depends on the file; on a resume it puts up none.
 
 use std::sync::Mutex;
 
@@ -11,6 +12,28 @@ use crate::feed::Offer;
 
 const READ_AHEAD: f64 = 9.0;
 const GAP: f64 = 0.5;
+/// A track of someone's own, in another folder.
+const OTHER: usize = 2;
+
+/// The size of the console's notice for each file.
+fn notice_for(file: usize) -> u32 {
+    match file {
+        STREAM => Config::default().stream_notice,
+        STOP => 790,
+        _ => 805,
+    }
+}
+
+/// A minute of someone's own music: every sample is 7.
+fn other_file() -> Vec<u8> {
+    let frames = (60 * RATE) as u32 / block() as u32;
+    let mut file = flac::header(frames as u64 * block() as u64, &Tags::default());
+    let audio = vec![7i16; block() * 2];
+    for index in 0..frames {
+        flac::push_frame(&mut file, index, &audio);
+    }
+    file
+}
 
 struct MemStore {
     files: Mutex<Vec<Vec<u8>>>,
@@ -99,6 +122,7 @@ impl Console {
         }
         self.state = State::Playing(open);
         self.said.push(Signal::Start);
+        self.said.push(Signal::Notice(notice_for(file)));
     }
 
     fn pause(&mut self, now: f64) {
@@ -225,11 +249,16 @@ struct Rig {
     in_flight: VecDeque<(f64, Signal)>,
     /// What the stream reported, with the time.
     notices: Vec<(f64, String)>,
+    /// When it reported the stream file started or resumed, and the track then on.
+    restarts: Vec<(f64, Option<String>)>,
+    /// The receiver was paused because the stream stopped for other music; it goes on when
+    /// the stream file is started (as the receiver does).
+    paused_for_other: bool,
 }
 
 impl Rig {
     fn new(config: Config) -> Rig {
-        let store = Arc::new(MemStore { files: Mutex::new(vec![Vec::new(); 2]) });
+        let store = Arc::new(MemStore { files: Mutex::new(vec![Vec::new(), Vec::new(), other_file()]) });
         let feed = Feed::new();
         let console =
             Console { store: store.clone(), state: State::Stopped, heard: Vec::new(), said: Vec::new(), waited: 0.0 };
@@ -245,6 +274,8 @@ impl Rig {
             delay: 0.3,
             in_flight: VecDeque::new(),
             notices: Vec::new(),
+            restarts: Vec::new(),
+            paused_for_other: false,
         }
     }
 
@@ -272,8 +303,19 @@ impl Rig {
                     "stop".to_string()
                 }
                 Notice::Track(track) => track.tags.title,
-                // Not of interest to these tests.
-                Notice::Restarted(_) => continue,
+                Notice::Away => {
+                    self.feeder.held = true;
+                    self.paused_for_other = true;
+                    "away".to_string()
+                }
+                // Kept apart, so the other tests need not list them.
+                Notice::Restarted(track) => {
+                    if std::mem::take(&mut self.paused_for_other) {
+                        self.feeder.held = false;
+                    }
+                    self.restarts.push((self.now, track.map(|track| track.tags.title)));
+                    continue;
+                }
             };
             self.notices.push((self.now, text));
         }
@@ -540,4 +582,92 @@ fn too_short_a_lead_is_caught() {
     rig.plan(1, 60.0);
     rig.run(120.0);
     assert_eq!(rig.heard_of(1), 60 * RATE);
+}
+
+#[test]
+fn the_start_is_announced_once_the_console_has_said_what_started() {
+    let mut rig = Rig::new(Config { grow: true, lead: 2.0, slack: 0.3, ..config() });
+    rig.run(1.0);
+    // Someone's own music first: no "ready", and nothing to report when the stream stops
+    // for it, since it never played.
+    rig.console.play(OTHER, rig.now);
+    rig.run(10.0);
+    assert!(rig.restarts.is_empty(), "{:?}", rig.restarts);
+    assert!(rig.notices.is_empty(), "{:?}", rig.notices);
+    assert!(matches!(rig.stream.player, Player::Waiting), "{}", rig.stream.status(rig.now));
+    // Now the stream file: "ready" as soon as the console's notice is in.
+    let started = rig.now;
+    rig.console.switch_to(STREAM, rig.now);
+    rig.run(5.0);
+    assert_eq!(rig.restarts.len(), 1, "{:?}", rig.restarts);
+    assert_eq!(rig.restarts[0].1, None);
+    assert!(rig.restarts[0].0 - started < 1.0, "{:?}", rig.restarts);
+    rig.plan(1, 20.0);
+    rig.run(40.0);
+    assert_eq!(rig.heard_of(1), 20 * RATE);
+}
+
+#[test]
+fn other_music_stops_the_stream_and_it_carries_on_when_started_again() {
+    let mut rig = Rig::new(Config { grow: true, lead: 2.0, slack: 0.3, ..config() });
+    rig.run(1.0);
+    rig.console.play(STREAM, rig.now);
+    rig.plan(1, 300.0);
+    rig.run(40.0);
+    let before = rig.console.heard.len();
+    // Someone's own track, picked while the stream plays.
+    rig.console.switch_to(OTHER, rig.now);
+    rig.run(20.0);
+    assert_eq!(rig.names(), ["Track 1", "away"]);
+    assert!(matches!(rig.stream.player, Player::Waiting), "{}", rig.stream.status(rig.now));
+    assert!(!rig.feed.accepting(), "audio would go nowhere");
+    // The file is whole again, for a start from its beginning, with nothing of what was
+    // played left in it: silence in valid frames up to where the writing had got to.
+    {
+        let files = rig.store.files.lock().unwrap();
+        assert_eq!(files[STREAM].len() as u64, flac::frame_offset(frames_in(0.5 * 3600.0)));
+        let mut at = AUDIO_START as usize;
+        let mut index = 0;
+        while let Some((number, samples, size)) = flac::read_frame(&files[STREAM][at..]) {
+            assert_eq!(number, index);
+            assert!(samples.iter().all(|&sample| sample == 0), "played audio is still in frame {index}");
+            at += size;
+            index += 1;
+        }
+        assert!(index >= frames_in(40.0), "silence only to frame {index}");
+    }
+    // Back to the stream file, from the list: it starts from its beginning, and Spotify
+    // goes on after the opening silence.
+    rig.console.switch_to(STREAM, rig.now);
+    rig.run(40.0);
+    assert!(matches!(rig.console.state, State::Playing(_)));
+    assert_eq!(rig.restarts.last().unwrap().1, None, "{:?}", rig.restarts);
+    let after: Vec<&[i16]> = rig.console.heard[before..].chunks_exact(2).collect();
+    let silent = after.iter().take_while(|pair| pair[1] == 0).count() as u64;
+    assert!(silent >= 12 * RATE && silent <= 17 * RATE, "{silent}");
+    let audio = after.iter().filter(|pair| pair[1] == 1).count() as u64;
+    assert!(audio > 20 * RATE, "{audio}");
+    assert!(rig.console.waited < 1.0, "the player waited {} s", rig.console.waited);
+}
+
+#[test]
+fn other_music_after_a_pause_at_the_console() {
+    let mut rig = Rig::new(Config { grow: true, lead: 2.0, slack: 0.3, ..config() });
+    rig.run(1.0);
+    rig.console.play(STREAM, rig.now);
+    rig.plan(1, 300.0);
+    rig.run(40.0);
+    rig.console.pause(rig.now);
+    rig.run(10.0);
+    // Someone's own track instead of a resume.
+    rig.console.state = State::Stopped;
+    rig.console.play(OTHER, rig.now);
+    rig.run(20.0);
+    assert_eq!(rig.names(), ["Track 1", "paused", "away"]);
+    assert!(matches!(rig.stream.player, Player::Waiting), "{}", rig.stream.status(rig.now));
+    // And back.
+    rig.console.switch_to(STREAM, rig.now);
+    rig.run(40.0);
+    assert!(matches!(rig.console.state, State::Playing(_)));
+    assert!(rig.console.heard.chunks_exact(2).rev().take(5 * RATE as usize).all(|pair| pair[1] == 1));
 }

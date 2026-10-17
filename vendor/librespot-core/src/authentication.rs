@@ -27,7 +27,7 @@ impl From<AuthenticationError> for Error {
 }
 
 /// The credentials are used to log into the Spotify API.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Credentials {
     pub username: Option<String>,
 
@@ -41,6 +41,9 @@ pub struct Credentials {
     pub auth_data: Vec<u8>,
 }
 
+impl std::fmt::Debug for Credentials{
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result{f.debug_struct("Credentials").field("auth_type",&self.auth_type).field("data",&"[redacted]").finish()}
+}
 impl Credentials {
     /// Intialize these credentials from a username and a password.
     ///

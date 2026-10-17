@@ -92,6 +92,7 @@ struct SessionData {
     client_model_name: String,
     connection_id: String,
     auth_data: Vec<u8>,
+    reusable_credentials:Option<Credentials>,
     time_delta: i64,
     invalid: bool,
     user_data: UserData,
@@ -249,15 +250,11 @@ impl Session {
         info!("Authenticated");
         self.set_username(username);
         self.set_auth_data(&reusable_credentials.auth_data);
+        self.0.data.write().expect(SESSION_DATA_POISON_MSG).reusable_credentials=Some(reusable_credentials.clone());
         if let Some(cache) = self.cache() {
             if store_credentials {
-                let cred_changed = cache
-                    .credentials()
-                    .map(|c| c != reusable_credentials)
-                    .unwrap_or(true);
-                if cred_changed {
-                    cache.save_credentials(&reusable_credentials);
-                }
+                // Also upgrades a validated device-bound v1 record after authentication.
+                cache.save_credentials(&reusable_credentials);
             }
         }
 
@@ -549,6 +546,7 @@ impl Session {
         );
     }
 
+    pub fn reusable_credentials(&self)->Option<Credentials>{self.0.data.read().expect(SESSION_DATA_POISON_MSG).reusable_credentials.clone()}
     pub fn auth_data(&self) -> Vec<u8> {
         self.0
             .data

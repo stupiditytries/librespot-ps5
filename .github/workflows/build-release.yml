@@ -1,0 +1,108 @@
+name: Build and draft release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: librespot-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install build tools
+        run: |
+          # The PS5 SDK's linker wrapper uses the newest LLVM it finds and needs lld 19 or later;
+          # the receiver is developed with LLVM 21 from apt.llvm.org. Clang 18 compiles the app.
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/apt-llvm.gpg
+          echo 'deb [signed-by=/usr/share/keyrings/apt-llvm.gpg] https://apt.llvm.org/noble/ llvm-toolchain-noble-21 main' \
+            | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y build-essential git curl unzip wget make \
+            ninja-build clang-18 lld-18 llvm-18 clang-21 lld-21 llvm-21 nasm python3
+          /usr/lib/llvm-21/bin/ld.lld --version
+      - name: Cache FFmpeg and Cargo downloads
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ${{ runner.temp }}/deps/ffmpeg-work/install
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: deps-${{ hashFiles('tools/ci/setup-deps.sh', 'player/ps5/build-canvas-ffmpeg.sh', 'player/ps5/ffmpeg-cc.sh', 'connect/Cargo.lock') }}
+      - name: Fetch pinned dependencies
+        run: bash tools/ci/setup-deps.sh "$RUNNER_TEMP/deps"
+      - name: Test, compile and package release payload
+        run: |
+          source "$RUNNER_TEMP/deps/env.sh"
+          bash tools/ci/build-release.sh
+      - name: Upload release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: librespot-ps5-${{ github.sha }}
+          path: |
+            dist/librespot-ps5.elf
+            dist/SHA256SUMS.txt
+            dist/BUILD-INFO.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  draft-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release notes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: docs/RELEASE-NOTES.md
+          sparse-checkout-cone-mode: false
+      - name: Download this run's release files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: librespot-ps5-${{ github.sha }}
+          path: dist
+      - name: Verify release files
+        working-directory: dist
+        run: sha256sum --check SHA256SUMS.txt
+      - name: Create or update draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo 'Use a version tag such as v2.0.0 or v2.0.0-rc.1' >&2
+            exit 1
+          fi
+          if draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft); then
+            if [[ "$draft" != true ]]; then
+              echo 'Release already published; leaving its assets alone'
+              exit 0
+            fi
+          else
+            gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease \
+              --title "librespot-ps5 $RELEASE_TAG" --notes-file docs/RELEASE-NOTES.md
+          fi
+          # The download is a ZIP with Kabuki in it; tools/release/bundle-with-kabuki.sh adds
+          # Kabuki and publishes. The receiver on its own is kept for checking.
+          gh release upload "$RELEASE_TAG" --clobber \
+            dist/librespot-ps5.elf dist/SHA256SUMS.txt dist/BUILD-INFO.txt

@@ -157,10 +157,12 @@ static void set_device_secret(void)
 
 /* Shows a notification (the receiver uses it for the track that has started). Sent as the
  * system user, as the console's own programs do. */
+#ifndef SHELL_PCM
 static int show_notification(const char *payload)
 {
     return sceNotificationSend(0xfe, true, payload);
 }
+#endif
 
 /* Exits when quit.txt changes. Its content at start is the baseline, so a file left over
  * from an earlier run does nothing. */
@@ -236,6 +238,14 @@ int main(void)
     pthread_t watcher;
     pthread_create(&watcher, NULL, quit_watcher, NULL);
 
+#ifdef USB_AUTOSTART
+    extern int usb_transport_quiesce_previous(void);
+    if (usb_transport_quiesce_previous() != 0) {
+        log_line("previous USB worker has not confirmed stop; receiver exits before changing the stream file");
+        return 1;
+    }
+#endif
+#ifndef SHELL_PCM
     if (connect_tape_start(DATA_DIR, receiver_log, NULL, debug, show_notification) != 0)
     {
         /* The reason is in the log. Without the stream file there is no way to be heard. */
@@ -254,6 +264,8 @@ int main(void)
         connect_tape_test(DATA_DIR);
         return 0;
     }
+
+#endif
 
     struct connect_settings settings;
     memset(&settings, 0, sizeof settings);

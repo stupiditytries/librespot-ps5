@@ -15,6 +15,18 @@ export PATH=$CARGO_HOME/bin:$PATH
 sdk=$TEMPLATE/.deps/native/ps5-payload-sdk
 target=$REPO/toolchain/x86_64-ps5-freebsd.json
 out=$WORK/connectd
+features=()
+if [[ ${USB_AUTOSTART:-0} == 1 ]]; then
+    out=$WORK/connectd-usb-autostart
+    features+=(--features usb-autostart)
+    OUTPUT=${OUTPUT:-$REPO/build/librespot-ps5-autostart.elf}
+fi
+if [[ ${SHELL_PCM:-0} == 1 ]]; then
+    out=$WORK/connectd-shell-pcm
+    features=(--features shell-pcm)
+    OUTPUT=${PCM_OUTPUT:-$REPO/build/librespot-ps5-pcm-test-v8.elf}
+fi
+OUTPUT=${OUTPUT:-$REPO/build/librespot-ps5.elf}
 mkdir -p "$out/obj" "$WORK/bin"
 
 # 1. The Rust static library.
@@ -27,7 +39,7 @@ printf '#!/bin/sh\nPS5_PAYLOAD_SDK=%s exec sh %s/tooling/prospero-clang18 "$@"\n
 chmod +x "$WORK/bin/ps5-cc"
 export CC_x86_64_ps5_freebsd=$WORK/bin/ps5-cc AR_x86_64_ps5_freebsd=llvm-ar-18
 (cd "$REPO/connect" && CARGO_TARGET_DIR=$WORK/target-connect cargo build --release \
-    --lib --target "$target" -Zbuild-std=std,panic_abort -Zjson-target-spec)
+    --lib "${features[@]}" --target "$target" -Zbuild-std=std,panic_abort -Zjson-target-spec)
 rust_lib=$WORK/target-connect/x86_64-ps5-freebsd/release/libconnect_ps5.a
 # With FreeBSD 11 layouts the libc crate asks for versioned names such as stat@FBSD_1.0; the
 # console's libraries export the same functions unversioned.
@@ -38,18 +50,28 @@ rust_lib=$WORK/target-connect/x86_64-ps5-freebsd/release/libconnect_ps5.a
 
 # 2. The program: its own main, and stand-ins for the few things the Rust library needs
 #    that the SDK's C library lacks or the console does differently. The console's media
-#    framework and audio output are not linked: this program must not call the first, and
-#    the second is muted for it.
+#    framework is called only by an optional worker inside ShellUI. The receiver
+#    itself does not own a media source; its audio output is muted.
 sources=("$REPO/connectd/src/main.c" "$REPO/connectd/src/standins.c"
     "$REPO/connectd/src/compat_socket.c")
 objects=()
+native_libs=()
+if [[ ${USB_AUTOSTART:-0} == 1 || ${SHELL_PCM:-0} == 1 ]]; then native_libs+=(-lkernel_sys -lSceLibcInternal); fi
 for source in "${sources[@]}"; do
     object=$out/obj/$(basename "$source").o
-    "$sdk/bin/prospero-clang" -O2 -Wall -ffile-prefix-map="$REPO"=. -c "$source" -o "$object"
+    cflags=()
+    if [[ ${USB_AUTOSTART:-0} == 1 || ${SHELL_PCM:-0} == 1 ]]; then cflags+=(-DUSB_AUTOSTART=1); fi
+    if [[ ${SHELL_PCM:-0} == 1 ]]; then cflags+=(-DSHELL_PCM=1); fi
+    "$sdk/bin/prospero-clang" -O2 -Wall "${cflags[@]}" -ffile-prefix-map="$REPO"=. -c "$source" -o "$object"
     objects+=("$object")
 done
+if [[ ${SHELL_PCM:-0} == 1 ]]; then
+    source "$REPO/connectd/pcm-transport/build.sh"
+elif [[ ${USB_AUTOSTART:-0} == 1 ]]; then
+    source "$REPO/connectd/usb-transport/build.sh"
+fi
 "$sdk/bin/prospero-clang" -o "$out/librespot-ps5.elf" "${objects[@]}" "$out/libconnect_ps5.a" \
-    -lSceNet -lSceNotification \
+    -lSceNet -lSceNotification "${native_libs[@]}" \
     -lc++ -lc++abi \
     -Wl,--error-limit=0 2>&1 | tee "$out/link.log"
 
@@ -58,4 +80,5 @@ done
 ls -la "$out/librespot-ps5.elf"
 readelf -d "$out/librespot-ps5.elf" | grep NEEDED
 mkdir -p "$REPO/build"
-cp "$out/librespot-ps5.elf" "$REPO/build/librespot-ps5.elf"
+cp "$out/librespot-ps5.elf" "$OUTPUT"
+sha256sum "$OUTPUT"

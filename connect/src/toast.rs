@@ -6,8 +6,10 @@
 //! The Music card cannot show a cover for music played from a USB drive, so this is where
 //! the cover goes.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Which kind of notification is sent:
 /// 0, the console's own "music track change" kind, as its shell sends it. It was seen on
@@ -22,6 +24,41 @@ static STYLE: AtomicU8 = AtomicU8::new(0);
 
 pub fn set_style(style: u8) {
     STYLE.store(style.min(3), Ordering::Relaxed);
+}
+
+/// The kind used for messages about the stream itself (ready, started, stopped, "play
+/// Librespot Streamer"). Not 0: the console puts up its own music notice at every start
+/// and pause of its player, on the same channel, and on 2026-10-14 that took the place of
+/// ours about half the time.
+static STATUS_STYLE: AtomicU8 = AtomicU8::new(2);
+
+pub fn set_status_style(style: u8) {
+    STATUS_STYLE.store(style.min(3), Ordering::Relaxed);
+}
+
+/// Sizes of the notifications this program sent lately. The console's log has a line for
+/// every notification, ours included, with only its size; these are left out when the
+/// console's own notices are looked for.
+static SENT: Mutex<VecDeque<(Instant, usize)>> = Mutex::new(VecDeque::new());
+const SENT_KEPT: Duration = Duration::from_secs(10);
+/// The console logs a notification as somewhat longer than the text handed to it (37 and
+/// 38 bytes longer on 2026-10-14).
+const LOGGED_EXTRA: std::ops::RangeInclusive<usize> = 20..=60;
+
+/// Notes that a notification of `length` bytes was handed to the console.
+pub fn note_sent(length: usize) {
+    let mut sent = SENT.lock().unwrap();
+    while sent.front().is_some_and(|(at, _)| at.elapsed() > SENT_KEPT) {
+        sent.pop_front();
+    }
+    sent.push_back((Instant::now(), length));
+}
+
+/// Whether a notification the console's log reports as `logged` bytes is one of ours.
+pub fn sent_by_us(logged: usize) -> bool {
+    SENT.lock().unwrap().iter().any(|&(at, length)| {
+        at.elapsed() <= SENT_KEPT && LOGGED_EXTRA.contains(&logged.saturating_sub(length)) && logged > length
+    })
 }
 
 fn escaped(text: &str) -> String {
@@ -67,7 +104,18 @@ fn timestamp(time: SystemTime) -> String {
 /// The notification for a track: `icon` is the path of a picture file on the console, if
 /// there is one. The template, channel and use case are the ones the console's shell uses
 /// for its own music; a later one replaces an earlier one, so quick skips do not pile up.
+pub fn song_payload(title:&str,artist:&str,icon:Option<&str>,now:SystemTime)->String{styled(0,title,artist,icon,now)}
+
 pub fn payload(title: &str, artist: &str, icon: Option<&str>, now: SystemTime) -> String {
+    styled(STYLE.load(Ordering::Relaxed), title, artist, icon, now)
+}
+
+/// A message about the stream (see `STATUS_STYLE`).
+pub fn status_payload(first: &str, second: &str, now: SystemTime) -> String {
+    styled(STATUS_STYLE.load(Ordering::Relaxed), first, second, None, now)
+}
+
+fn styled(style: u8, title: &str, artist: &str, icon: Option<&str>, now: SystemTime) -> String {
     let icon = match icon {
         Some(path) => format!(
             "\"icon\":{{\"type\":\"Url\",\"parameters\":{{\"url\":\"{}\"}}}},",
@@ -76,11 +124,11 @@ pub fn payload(title: &str, artist: &str, icon: Option<&str>, now: SystemTime) -
         None => String::new(),
     };
     let id = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
-    let kind = match STYLE.load(Ordering::Relaxed) {
+    let kind = match style {
         0 => concat!(
             "\"viewTemplateType\":\"ToastTemplateA\",\"toastOverwriteType\":\"Always\",",
             "\"channelType\":\"MusicTrackChange\",\"useCaseId\":\"NUC59\",",
-            "\"isImmediate\":false,\"priority\":2,"
+            "\"isImmediate\":false,\"priority\":1,"
         ),
         1 => concat!(
             "\"viewTemplateType\":\"ToastTemplateA\",\"toastOverwriteType\":\"Always\",",

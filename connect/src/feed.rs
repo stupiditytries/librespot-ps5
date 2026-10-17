@@ -26,6 +26,10 @@ pub enum Signal {
     End,
     /// The player's process crashed. It will be started afresh by the console.
     Crashed,
+    /// The console put up its own notice for a track its player has started, this many
+    /// bytes long. The log does not name the track, but the size depends on it, so it tells
+    /// the stream file apart from other music.
+    Notice(u32),
 }
 
 #[derive(Clone, Debug, Default)]

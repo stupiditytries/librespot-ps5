@@ -55,11 +55,17 @@ idle=600
 hours=12
 # toast: 1 shows a notification with the cover, title and artist when a track starts.
 toast=1
+# notice: size of the console's own notice for Librespot Streamer in its log. It is how
+#         the program tells that file apart from other music played at the console.
+notice=813
 # toast_style: which kind of notification: 0 the console's own small music kind, which
 #              takes the place of the console's own notice (not shown over games); 2 a
 #              larger general kind, shown as well as the console's own; 3 the same on a
 #              channel the console's pop-up settings do not hold back.
 toast_style=0
+# status_style: the same choice for messages about the stream itself (ready, started,
+#               stopped, play Librespot Streamer). 2 shows reliably.
+status_style=2
 ";
 
 struct Settings {
@@ -95,6 +101,8 @@ fn read_settings(data_dir: &Path) -> Settings {
             ("grow", Some(number)) => config.grow = number != 0.0,
             ("toast", Some(number)) => settings.toast = number != 0.0,
             ("toast_style", Some(number)) => crate::toast::set_style(number as u8),
+            ("status_style", Some(number)) => crate::toast::set_status_style(number as u8),
+            ("notice", Some(number)) => config.stream_notice = number as u32,
             ("rate", Some(number)) => repeat = number as usize,
             ("bits", Some(number)) => bits = number as usize,
             ("frame", Some(number)) => frame = number as usize,
@@ -224,7 +232,8 @@ impl Store for FileStore {
 /// The copy of the console's log stops growing at this size.
 const LOG_COPY_LIMIT: usize = 16 << 20;
 
-fn watch_log(signals: mpsc::Sender<Signal>, stop: Arc<AtomicBool>, copy_to: Option<PathBuf>) {
+fn watch_log(signals: mpsc::Sender<Signal>, stop: Arc<AtomicBool>, copy_to: Option<PathBuf>,
+    connected_at: Arc<Mutex<Option<Instant>>>) {
     // When asked for, everything read is also kept in a file: reading the log here may
     // keep the lines from a reader on the PC, and they are needed to see what the player
     // did.
@@ -248,6 +257,7 @@ fn watch_log(signals: mpsc::Sender<Signal>, stop: Arc<AtomicBool>, copy_to: Opti
         log::info!("reading the console's log");
         complained = false;
         let connected = Instant::now();
+        *connected_at.lock().unwrap() = Some(connected);
         let mut pending: Vec<u8> = Vec::new();
         let mut buffer = [0u8; 16384];
         loop {
@@ -284,7 +294,8 @@ fn watch_log(signals: mpsc::Sender<Signal>, stop: Arc<AtomicBool>, copy_to: Opti
                 } else if has(b"# proc name: SystemMusicCore.elf") {
                     // From the kernel's report of a fatal signal in the player.
                     Signal::Crashed
-
+                } else if let Some(size) = console_notice(line) {
+                    Signal::Notice(size)
                 } else {
                     continue;
                 };
@@ -293,11 +304,27 @@ fn watch_log(signals: mpsc::Sender<Signal>, stop: Arc<AtomicBool>, copy_to: Opti
                 }
             }
         }
+        *connected_at.lock().unwrap() = None;
         log::warn!("the console's log closed; connecting again");
         pause(Duration::from_secs(2));
     }
 }
 
+/// The size of a notification the console's log reports, from a line such as
+/// `[notification] Post7 isCronos= 0 logged= 0 useCaseId=  buflen= 813`, if it is one with
+/// no use case (the kind the console puts up when its player starts a track) and not one
+/// this program sent.
+fn console_notice(line: &[u8]) -> Option<u32> {
+    let text = std::str::from_utf8(line).ok()?;
+    let rest = &text[text.find("] Post7 ")?..];
+    let (_, after) = rest.split_once("useCaseId=")?;
+    let (use_case, size) = after.split_once("buflen=")?;
+    if !use_case.trim().is_empty() {
+        return None;
+    }
+    let size: u32 = size.trim().parse().ok()?;
+    (!crate::toast::sent_by_us(size as usize)).then_some(size)
+}
 
 // ---------------------------------------------------------------------------------------
 // The running stream
@@ -312,8 +339,16 @@ pub struct Tape {
     pub feed: Arc<Feed>,
     /// How to show a notification, if the app provided a way and the setting is on.
     pub notify: Option<NotifyFunction>,
+    /// How far the audio written runs ahead of what is heard (the lead setting).
+    pub lead: std::time::Duration,
     stop: Arc<AtomicBool>,
     on_notice: Mutex<Option<NoticeHandler>>,
+    #[cfg(feature="usb-autostart")]
+    native_prepare: AtomicBool,
+    #[cfg(feature="usb-autostart")]
+    native_prepared: AtomicBool,
+    #[cfg(feature="usb-autostart")]
+    log_connected: Arc<Mutex<Option<Instant>>>,
 }
 
 static TAPE: OnceLock<Arc<Tape>> = OnceLock::new();
@@ -324,6 +359,16 @@ pub fn current() -> Option<Arc<Tape>> {
 }
 
 impl Tape {
+    #[cfg(feature="usb-autostart")]
+    pub fn native_prepared(&self) -> bool {
+        self.native_prepared.load(Ordering::Acquire)
+            && self.log_connected.lock().unwrap().is_some_and(|at|at.elapsed()>=LOG_HISTORY+Duration::from_millis(250))
+    }
+    #[cfg(feature="usb-autostart")]
+    pub fn prepare_native_start(&self) {
+        self.native_prepared.store(false, Ordering::Release);
+        self.native_prepare.store(true, Ordering::Release);
+    }
     /// Has `handler` told what the stream notices (see [`Notice`]).
     pub fn on_notice(&self, handler: NoticeHandler) {
         *self.on_notice.lock().unwrap() = Some(handler);
@@ -347,6 +392,9 @@ pub fn start(data_dir: &Path, notify: Option<NotifyFunction>, debug: bool) -> Re
     let settings = read_settings(data_dir);
     let (stream_folder, controls_folder) = find_or_make_folders()?;
     let config = settings.config;
+    #[cfg(feature="usb-autostart")]
+    let config = Config { idle_limit: config.idle_limit.max(330.0), ..config };
+    let lead = std::time::Duration::from_secs_f64(config.lead);
     log::info!(
         "stream: {}{}, frames of {}, {} s ahead of the player, stops after {} s without audio, notifications {}",
         stream_folder.display(),
@@ -370,18 +418,26 @@ pub fn start(data_dir: &Path, notify: Option<NotifyFunction>, debug: bool) -> Re
     let mut stream = Stream::new(config, Arc::new(store), feed.clone())
         .map_err(|e| format!("preparing the stream file: {e}"))?;
 
+    let log_connected = Arc::new(Mutex::new(None));
     let tape = Arc::new(Tape {
         feed,
         notify: notify.filter(|_| settings.toast),
+        lead,
         stop: Arc::new(AtomicBool::new(false)),
         on_notice: Mutex::new(None),
+        #[cfg(feature="usb-autostart")]
+        native_prepare: AtomicBool::new(false),
+        #[cfg(feature="usb-autostart")]
+        native_prepared: AtomicBool::new(true),
+        #[cfg(feature="usb-autostart")]
+        log_connected: log_connected.clone(),
     });
     let (sender, receiver) = mpsc::channel();
     let stop = tape.stop.clone();
     // The copy of the console's log is for finding faults: it is large, and the log has
     // other programs' lines in it.
     let copy_to = debug.then(|| data_dir.join("klog.txt"));
-    std::thread::spawn(move || watch_log(sender, stop, copy_to));
+    std::thread::spawn(move || watch_log(sender, stop, copy_to, log_connected));
 
     let running = tape.clone();
     std::thread::spawn(move || {
@@ -392,6 +448,16 @@ pub fn start(data_dir: &Path, notify: Option<NotifyFunction>, debug: bool) -> Re
             signals.clear();
             signals.extend(receiver.try_iter());
             let now = begun.elapsed().as_secs_f64();
+            #[cfg(feature="usb-autostart")]
+            if running.native_prepare.swap(false, Ordering::AcqRel) {
+                // Requested only after the worker confirms native Stop; the file is no
+                // longer being read. Reset stale log events before preparing its header.
+                signals.clear();
+                match stream.prepare_native_start() {
+                    Ok(()) => running.native_prepared.store(true, Ordering::Release),
+                    Err(e) => log::error!("USB transport: cannot prepare Streamer after stop: {e}"),
+                }
+            }
             for &signal in &signals {
                 log::debug!("console log: {signal:?} at {now:.2}");
             }
@@ -489,4 +555,21 @@ pub fn run_test(tape: &Tape, data_dir: &Path) {
         }
     }
     log::info!("stream test: stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn console_notices_are_read_from_the_log() {
+        let line = |text: &str| console_notice(text.as_bytes());
+        assert_eq!(line("<118>[notification] Post7 isCronos= 0 logged= 0 useCaseId=  buflen= 813 "), Some(813));
+        assert_eq!(line("<118>[notification] Post7 isCronos= 0 logged= 0 useCaseId= NUC57 buflen= 218 "), None);
+        assert_eq!(line("<118>[notification] Post7 isCronos= 0 logged= 0 useCaseId= LEONARDO_KEY_MAPPING_PREVIEW buflen= 59 "), None);
+        assert_eq!(line("<118>something else buflen= 813"), None);
+        // One of ours, as the console logs it (a few dozen bytes longer than what was sent).
+        crate::toast::note_sent(437);
+        assert_eq!(line("<118>[notification] Post7 isCronos= 0 logged= 0 useCaseId=  buflen= 475 "), None);
+    }
 }

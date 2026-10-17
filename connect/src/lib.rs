@@ -8,11 +8,31 @@
 //! Credentials are cached under `cache_dir`, so after the first pairing from the phone the
 //! console reconnects by itself. Pairing needs no password on the console.
 
+pub mod control;
+#[cfg(feature="kabuki-provider")]
+mod kabuki;
 pub mod feed;
 pub mod flac;
 pub mod host;
+pub mod library;
+mod media_api;
+mod media_features;
+mod login;
+#[cfg(feature="kabuki-provider")]
+mod track_notices;
+#[allow(dead_code)] // Kept for reference: library views now use client_api.rs.
+mod web_api;
+mod client_api;
+mod browse_cache;
+mod native_library;
+#[cfg(feature="shell-pcm")]
+mod pcm;
 pub mod stream;
 pub mod toast;
+#[cfg(feature="usb-autostart")]
+mod usb_policy;
+#[cfg(feature="usb-autostart")]
+mod transport;
 
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::future::Future;
@@ -23,7 +43,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use librespot::connect::{ConnectConfig, Spirc};
+use librespot::connect::{ConnectConfig, LoadRequest, Spirc};
 use librespot::core::authentication::Credentials;
 use librespot::core::cache::Cache;
 use librespot::core::config::{DeviceType, SessionConfig};
@@ -160,11 +180,13 @@ fn say(callbacks: &ConnectCallbacks, text: &str) {
 // ---------------------------------------------------------------------------------------
 
 /// Hands every decoded packet to the app as 16-bit samples.
+#[cfg(not(feature="shell-pcm"))]
 struct AppSink {
     callbacks: ConnectCallbacks,
     started: bool,
 }
 
+#[cfg(not(feature="shell-pcm"))]
 impl Sink for AppSink {
     fn start(&mut self) -> SinkResult<()> {
         if !self.started {
@@ -286,27 +308,43 @@ impl Sink for TapeSink {
 /// Where the cover pictures for notifications are kept on the console.
 const COVER_DIR: &str = "/user/data/spotifyps5/covers";
 /// How many are kept. The newest are the ones a notification may still be showing.
-const COVERS_KEPT: usize = 8;
+const COVERS_KEPT: usize = 32;
 
 /// The file name for a cover: the picture's own identifier, which is the last part of its
 /// address. Every picture has its own file, because the console remembers a picture by
 /// its file name: when a few names were used in turn, a notification sometimes showed the
 /// cover that had the name before (seen 2026-10-12).
 fn cover_name(address: &str) -> Option<String> {
-    let id: String = address.rsplit('/').next()?.chars().take(64).collect();
-    (!id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric())).then(|| format!("{id}.jpg"))
+    let path = address.split(['?', '#']).next()?;
+    let id = path.rsplit('/').next()?;
+    if id.is_empty() || id=="." || id==".." { return None; }
+    let simple=id.chars().all(|c|c.is_ascii_alphanumeric());
+    let image_file=[".jpg",".jpeg",".png",".webp"].iter().any(|ext|id.to_ascii_lowercase().ends_with(ext))
+        && id.chars().all(|c|c.is_ascii_alphanumeric()||matches!(c,'.'|'_'|'-'));
+    if !simple&&!image_file{return None;}
+    // Official Liked Songs and generated artwork use full image filenames.
+    // Hash those URLs and long mosaics so filenames stay distinct and safe.
+    if !path.starts_with("https://i.scdn.co/image/") || !simple || id.len() > 64 {
+        use sha1::{Digest, Sha1};
+        return Some(format!("{}.jpg", hex::encode(Sha1::digest(path.as_bytes()))));
+    }
+    Some(format!("{id}.jpg"))
 }
 
-/// Removes all but the newest covers.
-fn tidy_covers() {
-    let Ok(entries) = std::fs::read_dir(COVER_DIR) else { return };
+/// Where the queue's cover pictures are kept, and how many.
+const QUEUE_COVER_DIR: &str = "/user/data/spotifyps5/queue-covers";
+const QUEUE_COVERS_KEPT: usize = 128;
+
+/// Removes all but the newest `keep` covers in `dir`.
+fn tidy_covers(dir: &str, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
         .flatten()
         .filter(|entry| entry.path().extension().is_some_and(|extension| extension == "jpg"))
         .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
         .collect();
     files.sort();
-    for (_, path) in files.iter().rev().skip(COVERS_KEPT) {
+    for (_, path) in files.iter().rev().skip(keep) {
         let _ = std::fs::remove_file(path);
     }
 }
@@ -323,35 +361,102 @@ fn cover_address_allowed(address: &str) -> bool {
     !host.contains('@') && !host.contains(':') && (host == "i.scdn.co" || host.ends_with(".scdn.co") || host.ends_with(".spotifycdn.com"))
 }
 
+// Match the formats accepted by Kabuki's image validator. A .jpg name alone is
+// not evidence: old downloads may contain WebP, an HTTP error page or partial data.
+fn supported_picture_header(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xff, 0xd8, 0xff]) ||
+        bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+}
+
+fn cached_picture_supported(path: &str) -> bool {
+    use std::io::Read;
+    let Ok(info) = std::fs::symlink_metadata(path) else { return false };
+    if !info.is_file() || info.len() == 0 || info.len() > COVER_LIMIT as u64 { return false; }
+    let Ok(mut file) = std::fs::File::open(path) else { return false };
+    let mut head = [0u8; 8];
+    let Ok(n) = file.read(&mut head) else { return false };
+    supported_picture_header(&head[..n])
+}
+
+fn canonical_cover(bytes:&[u8])->Result<bytes::Bytes,String>{
+    let mut reader=image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|_|"Unknown cover format")?;
+    let mut limits=image::Limits::default();limits.max_image_width=Some(4096);limits.max_image_height=Some(4096);limits.max_alloc=Some(64*1024*1024);
+    reader.limits(limits);
+    let image=reader.decode().map_err(|_|"Could not decode artwork")?.thumbnail(1024,1024).to_rgb8();
+    let mut output=Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output,88).encode_image(&image).map_err(|_|"Could not encode artwork")?;
+    if output.len()>COVER_LIMIT{return Err("Artwork is too large".into());}
+    Ok(bytes::Bytes::from(output))
+}
+
 async fn fetch(session: &Session, address: &str) -> Result<bytes::Bytes, String> {
     if !cover_address_allowed(address) {
         return Err("not an address of Spotify's picture servers".to_string());
     }
     let request = http::Request::get(address)
+        .header(http::header::ACCEPT, "image/jpeg, image/png")
         .body(bytes::Bytes::new())
         .map_err(|e| e.to_string())?;
-    let picture = session.http_client().request_body(request).await.map_err(|e| e.to_string())?;
+    use http_body_util::BodyExt;
+    let response=session.http_client().request_fut(request).map_err(|_|"Artwork network unavailable")?.await.map_err(|_|"Artwork network unavailable")?;
+    if response.status()!=200{return Err(format!("Artwork HTTP {}",response.status().as_u16()));}
+    let mut body=response.into_body();let mut data=Vec::new();
+    while let Some(frame)=body.frame().await{if let Ok(bytes)=frame.map_err(|_|"Artwork read failed")?.into_data(){
+        if data.len()+bytes.len()>COVER_LIMIT{return Err("Artwork is too large".into());}data.extend_from_slice(&bytes);
+    }}
+    let picture=bytes::Bytes::from(data);
     if picture.len() > COVER_LIMIT {
         return Err(format!("{} bytes is too large for a cover", picture.len()));
     }
-    Ok(picture)
+    if supported_picture_header(&picture){return Ok(picture);}
+    // Spotify's CDN can send WebP despite the requested Accept types. Convert
+    // once in the receiver so Kabuki and the app share a supported cache asset.
+    if picture.starts_with(b"RIFF")&&picture.get(8..12)==Some(b"WEBP"){
+        static CONVERSIONS:OnceLock<Arc<tokio::sync::Semaphore>>=OnceLock::new();
+        let permit=CONVERSIONS.get_or_init(||Arc::new(tokio::sync::Semaphore::new(2))).clone().acquire_owned().await.map_err(|_|"Artwork conversion unavailable")?;
+        let converted=tokio::task::spawn_blocking(move||{let _permit=permit;canonical_cover(&picture)}).await.map_err(|_|"Cover conversion failed".to_string())?;
+        return converted;
+    }
+    log::warn!("cover format unsupported bytes={} kind={}",picture.len(),if picture.starts_with(b"<"){"html"}else if picture.starts_with(&[0x1f,0x8b]){"gzip"}else{"unknown"});
+    Err("Artwork is temporarily unavailable".into())
 }
 
 /// Fetches a track's cover and saves it where the console can show it. Returns the file's
 /// path, or nothing if there is no cover or it cannot be had in a few seconds.
 async fn cover_file(session: &Session, track: &feed::Track) -> Option<String> {
-    let path = format!("{COVER_DIR}/{}", cover_name(&track.cover)?);
-    if std::fs::metadata(&path).is_ok_and(|file| file.len() > 0) {
-        return Some(path);
+    cover_file_in(session, track, COVER_DIR, COVERS_KEPT).await
+}
+
+async fn cover_file_in(session: &Session, track: &feed::Track, dir: &str, keep: usize) -> Option<String> {
+    picture_file(session, &track.cover, dir, keep).await
+}
+
+/// Fetches the picture at `address` (Spotify's picture servers only) into `dir`, keeping the
+/// newest `keep` there. Returns its path, or nothing if it cannot be had in a few seconds.
+pub(crate) fn cached_picture_file(address: &str, dir: &str) -> Option<String> {
+    if !cover_address_allowed(address) { return None; }
+    let name = cover_name(address)?;
+    // A cover already fetched for the queue or a notification also serves Library.
+    for folder in [dir, COVER_DIR, QUEUE_COVER_DIR, "/user/data/spotifyps5/library-covers"] {
+        let path = format!("{folder}/{name}");
+        if cached_picture_supported(&path) {
+            return Some(path);
+        }
     }
-    match tokio::time::timeout(Duration::from_secs(6), fetch(session, &track.cover)).await {
+    None
+}
+
+pub(crate) async fn picture_file(session: &Session, address: &str, dir: &str, keep: usize) -> Option<String> {
+    if let Some(path) = cached_picture_file(address, dir) { return Some(path); }
+    let path = format!("{dir}/{}", cover_name(address)?);
+    match tokio::time::timeout(Duration::from_secs(6), fetch(session, address)).await {
         Ok(Ok(picture)) => {
-            let _ = std::fs::create_dir_all(COVER_DIR);
+            let _ = std::fs::create_dir_all(dir);
             // Written under another name first, so the console never reads half a file.
             let partial = format!("{path}.part");
             match std::fs::write(&partial, &picture).and_then(|()| std::fs::rename(&partial, &path)) {
                 Ok(()) => {
-                    tidy_covers();
+                    tidy_covers(dir, keep);
                     return Some(path);
                 }
                 Err(e) => log::warn!("could not save the cover to {path}: {e}"),
@@ -365,6 +470,7 @@ async fn cover_file(session: &Session, track: &feed::Track) -> Option<String> {
 
 fn send_toast(notify: host::NotifyFunction, first: &str, second: &str, icon: Option<&str>) {
     let payload = toast::payload(first, second, icon, std::time::SystemTime::now());
+    toast::note_sent(payload.len());
     let Ok(payload) = CString::new(payload) else { return };
     let code = notify(payload.as_ptr());
     if code != 0 {
@@ -372,11 +478,132 @@ fn send_toast(notify: host::NotifyFunction, first: &str, second: &str, icon: Opt
     }
 }
 
+/// Why this program paused Spotify, so that it knows when to start it again.
+#[derive(Clone, Copy, PartialEq)]
+enum PausedBy {
+    /// Paused at the console: Spotify goes on when the stream is resumed there.
+    Console,
+    /// Nothing was playing "Librespot Streamer" (not started yet, other music, the stop
+    /// file): Spotify goes on when it is started.
+    NotRunning,
+}
+
+/// Shown when Spotify starts playing while nothing plays the stream file.
+#[cfg(not(feature="usb-autostart"))]
+const OPEN_FIRST: (&str, &str) = ("Play \"Librespot Streamer\" to listen", "Music > Start Librespot");
+/// Shown at most this often.
+#[cfg(not(feature="usb-autostart"))]
+const OPEN_FIRST_EVERY: Duration = Duration::from_secs(3);
+
+/// Shows a message about the stream itself.
+fn send_status(_notify: host::NotifyFunction, _first: &str, _second: &str) {
+    // Deliberately quiet: no receiver started/stopped/ready status notifications.
+}
 /// Shows the notification for a track that has just become audible, with its cover.
 /// Nothing here can hold up the audio.
 async fn show_toast(session: Session, track: feed::Track, notify: host::NotifyFunction) {
     let icon = cover_file(&session, &track).await;
     send_toast(notify, &track.tags.title, &track.tags.artist, icon.as_deref());
+}
+
+// ---------------------------------------------------------------------------------------
+// The overlay panel's channel (see control.rs)
+// ---------------------------------------------------------------------------------------
+
+type Panel = Option<Arc<tokio::sync::watch::Sender<control::State>>>;
+
+fn publish(panel: &Panel, change: impl FnOnce(&mut control::State)) {
+    if let Some(panel) = panel {
+        panel.send_modify(change);
+    }
+}
+
+/// Shows a track that has just become audible (its position comes from the timeline), and
+/// fetches its cover for the panel.
+fn show_track(panel: &Panel, session: &Session, track: feed::Track) {
+    publish(panel, |s| {
+        s.title = track.tags.title.clone();
+        s.artist = track.tags.artist.clone();
+        s.album = track.tags.album.clone();
+        s.duration_ms = (track.seconds * 1000.0).max(0.0) as u32;
+        s.cover.clear();
+    });
+    if let Some(sender) = panel.clone() {
+        let session = session.clone();
+        tokio::spawn(async move {
+            if let Some(path) = cover_file(&session, &track).await {
+                // Only if the panel still shows this track.
+                sender.send_if_modified(|s| {
+                    let same = s.title == track.tags.title && s.cover != path;
+                    if same {
+                        s.cover = path;
+                    }
+                    same
+                });
+            }
+        });
+    }
+}
+
+/// Starts playing at once, at `track` (a URI) if given.
+fn local_start(spirc:&Spirc,request:LoadRequest)->Result<(),librespot::core::Error>{
+    #[cfg(feature="kabuki-provider")]
+    if !kabuki::permit_play(){return Err(librespot::core::Error::failed_precondition("Kabuki is required"));}
+    spirc.activate().and_then(|()|spirc.load(request))
+}
+fn play_options(track: Option<String>) -> librespot::connect::LoadRequestOptions {
+    librespot::connect::LoadRequestOptions {
+        start_playing: true,
+        seek_to: 0,
+        context_options: None,
+        playing_track: track.map(librespot::connect::PlayingTrack::Uri),
+    }
+}
+
+/// How many queued tracks the panel is told about.
+const QUEUE_SHOWN: usize = 32;
+
+/// Looks up title, artists and cover for each queued URI (remembered between calls) and gives
+/// the panel the list, unless a newer queue has arrived meanwhile (`generation`).
+async fn resolve_queue(
+    session: Session,
+    uris: Vec<String>,
+    known: Arc<Mutex<std::collections::HashMap<String, control::QueueEntry>>>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    mine: u64,
+    panel: Panel,
+) {
+    let mut entries = Vec::with_capacity(uris.len());
+    for (index, uri) in uris.into_iter().enumerate() {
+        if generation.load(Ordering::Relaxed) != mine {
+            return;
+        }
+        if let Some(mut entry) = known.lock().unwrap().get(&uri).cloned() {
+            entry.index = index as u32;
+            entries.push(entry);
+            continue;
+        }
+        let Ok(id) = librespot::core::SpotifyUri::from_uri(&uri) else { continue };
+        let item = match tokio::time::timeout(Duration::from_secs(5), AudioItem::get_file(&session, id)).await {
+            Ok(Ok(item)) => item,
+            Ok(Err(e)) => {
+                log::warn!("queue: no details for {uri}: {e}");
+                continue;
+            }
+            Err(_) => {
+                log::warn!("queue: details for {uri} took too long");
+                continue;
+            }
+        };
+        let track = track_of(&item);
+        let cover = cover_file_in(&session, &track, QUEUE_COVER_DIR, QUEUE_COVERS_KEPT).await.unwrap_or_default();
+        let entry = control::QueueEntry { duration_ms:item.duration_ms,explicit:item.is_explicit,uri: uri.clone(), index: index as u32, title: track.tags.title.clone(), artist: track.tags.artist.clone(), cover };
+        known.lock().unwrap().insert(uri, entry.clone());
+        entries.push(entry);
+    }
+    if generation.load(Ordering::Relaxed) == mine {
+        publish(&panel, |s| s.queue = Some(entries));
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -400,6 +627,7 @@ pub fn device_id_for(name: &str) -> String {
 }
 
 async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
+    #[cfg(feature="shell-pcm")] let _=callbacks;
     let device_id = device_id_for(&settings.name);
     let mut session_config = SessionConfig::default();
     session_config.device_id = device_id.clone();
@@ -456,6 +684,7 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
         gapless: true,
         ..PlayerConfig::default()
     };
+    #[cfg(not(feature="shell-pcm"))]
     let sink_callbacks = callbacks;
     // With a tape running the audio goes to it, not to the app.
     let tape = host::current();
@@ -465,6 +694,9 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
     let player = Player::new(player_config, session.clone(), mixer.get_soft_volume(), move || {
         match sink_tape {
             Some(tape) => Box::new(TapeSink { tape, events: events_for_sink, track: None }),
+            #[cfg(feature="shell-pcm")]
+            None => Box::new(pcm::Sink::default()),
+            #[cfg(not(feature="shell-pcm"))]
             None => Box::new(AppSink {
                 callbacks: sink_callbacks,
                 started: false,
@@ -473,11 +705,11 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
     });
     // A pause or resume at the console is passed on to Spotify, so the phone agrees with
     // what is heard.
-    let mut player_events: Option<PlayerEventChannel> = None;
+    // The overlay panel needs the player's events too, with or without a tape.
+    let mut player_events: Option<PlayerEventChannel> = Some(player.get_player_event_channel());
     let mut notices = None;
     if let Some(tape) = &tape {
         *sink_events.lock().unwrap() = Some(player.get_player_event_channel());
-        player_events = Some(player.get_player_event_channel());
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         tape.on_notice(Box::new(move |notice| {
             let _ = sender.send(notice);
@@ -485,7 +717,55 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
         notices = Some(receiver);
     }
     let mut playing = false;
-    let mut paused_from_console = false;
+    let mut paused_by_us: Option<PausedBy> = None;
+    #[cfg(not(feature="usb-autostart"))]
+    let mut told_to_open: Option<Instant> = None;
+    let notify = tape.as_ref().and_then(|tape| tape.notify);
+
+    // The overlay panel's channel. What it is told is what is heard: librespot's changes go
+    // into a timeline that is heard `lead` later, and a new track is shown when the stream
+    // says it has become audible.
+    let lead = tape.as_ref().map_or(Duration::ZERO, |tape| tape.lead);
+    // Install before opening UI ports: a bind failure must never allow playback.
+    #[cfg(feature="kabuki-provider")]
+    librespot::connect::on_playback_gate(kabuki::permit_play);
+    let (panel, mut panel_commands, panel_lines): (Panel, _, _) = match control::listen(lead).await {
+        Ok(control) => {
+            #[cfg(feature="kabuki-provider")]
+            {kabuki::start(control.state.clone(),control.lines.clone(),control.sender.clone());
+             track_notices::start(control.state.clone());}
+            log::info!("overlay panel channel on 127.0.0.1:{}", control::PORT);
+            (Some(control.state), Some(control.commands), Some(control.lines))
+        }
+        Err(e) => {
+            log::warn!("no channel for the overlay panel: {e}");
+            (None, None, None)
+        }
+    };
+    let streaming_now = || {
+        #[cfg(feature="shell-pcm")] {return transport::state()==2;}
+        #[cfg(not(feature="shell-pcm"))] {tape.as_ref().map_or(true, |tape| tape.feed.accepting())}
+    };
+    publish(&panel, |s| s.streaming = streaming_now());
+    // Play or pause asked for by the panel while a track loads, sent once it has loaded:
+    // librespot's player refuses both until then and can be left stuck ("Player::play
+    // called from invalid state: Stopped", seen 2026-10-15).
+    let mut deferred_play: Option<bool> = None;
+    let mut app_search:Option<tokio::task::JoinHandle<()>>=None;
+    tokio::spawn(async {if let Err(e)=media_api::serve_art().await{log::warn!("Art server unavailable: {e}");}});
+    // The queue, as librespot-connect reports it each time it sends the connect state.
+    let (queue_sender, mut queue_uris) = tokio::sync::mpsc::unbounded_channel::<(String, Vec<librespot::connect::NextTrack>)>();
+    librespot::connect::on_next_tracks(move |context, uris| {
+        let _ = queue_sender.send((context, uris));
+    });
+    let mut last_queue: Option<Vec<String>> = None;
+    // The context playing (a playlist, an album…) and its whole queue, to play a queued track.
+    let (recent_sender,mut recent_contexts)=tokio::sync::mpsc::unbounded_channel::<String>();
+    librespot::connect::on_context_played(move |uri|{let _=recent_sender.send(uri.to_owned());});
+    let mut current_context = String::new();
+    let mut full_queue: Vec<librespot::connect::NextTrack> = Vec::new();
+    let queue_known: Arc<Mutex<std::collections::HashMap<String, control::QueueEntry>>> = Arc::default();
+    let queue_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // Advertise on the network. A failure is not fatal when a saved login exists.
     let mut discovery = match start_discovery(&settings, &device_id, &client_id) {
@@ -503,15 +783,72 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
         log::info!("waiting for the Spotify app to pick \"{}\"", settings.name);
     }
 
+    #[cfg(feature="usb-autostart")]
+    librespot::connect::on_playback_intent(transport::intent);
+    #[cfg(feature="usb-autostart")]
+    let mut last_transport_state = 0;
+    let mut transport_tick = tokio::time::interval(Duration::from_millis(250));
+    transport_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     let mut spirc: Option<Spirc> = None;
     let mut spirc_task: Option<SpircTask> = None;
     let mut connecting = last_credentials.is_some();
     let mut connected_at: Option<Instant> = None;
     let mut retry = MIN_RETRY;
+    let mut retry_at=tokio::time::Instant::now();
+    publish(&panel,|s|{s.auth_status=if connecting{"connecting"}else{"unpaired"}.into();});
 
     loop {
         tokio::select! {
             _ = stop_signal().notified() => break,
+
+            _ = transport_tick.tick(), if cfg!(feature="usb-autostart") => {
+                #[cfg(feature="usb-autostart")]
+                if let Some(tape) = &tape {
+                    let state = transport::state();
+                    if state != last_transport_state {
+                        log::info!("USB transport state: {state}");
+                        if state < 0 && transport::wanted() {
+                            if let Some(notify) = notify {
+                                send_status(notify, "Streamer could not start automatically", "Open Librespot Streamer, then press Play again");
+                            }
+                        }
+                        last_transport_state = state;
+                    }
+                    let decision = transport::tick(tape.feed.accepting(), tape.native_prepared());
+                    if decision.reset { tape.prepare_native_start(); }
+                    if let Some(action) = decision.native { transport::request(action); }
+                    if decision.resume && transport::wanted() {
+                        if let Some(spirc) = &spirc {
+                            log::info!("USB Streamer ready: resuming Spotify");
+                            paused_by_us = None;
+                            let _ = spirc.play();
+                        }
+                    }
+                    publish(&panel, |s| s.streaming = streaming_now());
+                }
+                #[cfg(feature="shell-pcm")]
+                if tape.is_none() {
+                    let state=transport::state();
+                    if pcm::pause_for_transition(last_transport_state,state,transport::wanted()) {
+                        transport::intent(false);
+                        if let Some(spirc)=&spirc {let _=spirc.pause();}
+                    }
+                    if pcm::resume_for_transition(last_transport_state,state,transport::wanted()) {
+                        log::info!("PCM service resumed at the console: Spotify goes on");
+                        transport::intent(true);
+                        if let Some(spirc)=&spirc {paused_by_us=None;let _=spirc.play();}
+                    }
+                    if state!=last_transport_state {log::info!("PCM service state: {state}");last_transport_state=state;}
+                    let decision=transport::tick(state==2,true);
+                    if let Some(action)=decision.native {transport::request(action);}
+                    if decision.resume&&transport::wanted() {
+                        if let Some(spirc)=&spirc {paused_by_us=None;let _=spirc.play();}
+                    }
+                    publish(&panel,|s|s.streaming=state==2);
+                }
+            }
+
 
             event = async {
                 match player_events.as_mut() {
@@ -519,9 +856,143 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
                     None => std::future::pending().await,
                 }
             } => {
+                // The overlay panel's view of the event: what librespot plays now is heard
+                // `lead` later.
+                let now = Instant::now();
+                let mut loaded = false;
+                match &event {
+                    Some(PlayerEvent::Loading { position_ms, .. }) => publish(&panel, |s| {
+                        s.loading = true;
+                        s.timeline.record(now, *position_ms, false, false);
+                    }),
+                    Some(PlayerEvent::Playing { position_ms, .. }) => {
+                        loaded = true;
+                        publish(&panel, |s| {
+                            s.loading = false;
+                            s.timeline.record(now, *position_ms, true, false);
+                        })
+                    }
+                    Some(PlayerEvent::Paused { position_ms, .. }) => {
+                        loaded = true;
+                        publish(&panel, |s| {
+                            s.loading = false;
+                            s.timeline.record(now, *position_ms, false, false);
+                        })
+                    }
+                    Some(PlayerEvent::Seeked { position_ms, .. }) => {
+                        #[cfg(feature="shell-pcm")] pcm::flush();
+                        publish(&panel, |s| {
+                        let moving = s.timeline.moving();
+                        s.timeline.record(now, *position_ms, moving, false);
+                    })},
+                    Some(
+                        PlayerEvent::PositionCorrection { position_ms, .. }
+                        | PlayerEvent::PositionChanged { position_ms, .. },
+                    ) => publish(&panel, |s| {
+                        let moving = s.timeline.moving();
+                        s.timeline.record(now, *position_ms, moving, true);
+                    }),
+                    Some(PlayerEvent::Stopped { .. }) => publish(&panel, |s| {
+                        s.loading = false;
+                        let at = s.timeline.played(now);
+                        s.timeline.record(now, at, false, false);
+                    }),
+                    Some(PlayerEvent::VolumeChanged { volume }) => {
+                        publish(&panel, |s| s.volume = (*volume as u32 * 100 + 32767) / 65535)
+                    }
+                    Some(PlayerEvent::ShuffleChanged { shuffle }) => publish(&panel, |s| s.shuffle = *shuffle),
+                    Some(PlayerEvent::RepeatChanged { context, track }) => publish(&panel, |s| {
+                        s.repeat = match (*track, *context) {
+                            (true, _) => control::Repeat::One,
+                            (false, true) => control::Repeat::All,
+                            (false, false) => control::Repeat::Off,
+                        }
+                    }),
+                    // With a tape the track is shown when the stream says it is heard.
+                    Some(PlayerEvent::TrackChanged { audio_item }) if tape.is_none() => {
+                        publish(&panel,|s|{
+                            s.media_generation=s.media_generation.wrapping_add(1);
+                            if s.media_session==0{s.media_session=crate::native_library::millis();}
+                            s.uri=audio_item.track_id.to_uri().unwrap_or_default();
+                            s.explicit=audio_item.is_explicit;
+                            s.cover_large.clear();
+                            s.background.clear();
+                        });
+                        if let Some(sender)=panel.clone(){
+                            let session=session.clone();let uri=audio_item.uri.clone();
+                            let address=audio_item.covers.iter().min_by_key(|c|(c.width-640).abs()).map(|c|c.url.clone()).unwrap_or_default();
+                            tokio::spawn(async move{
+                                let large=picture_file(&session,&address,COVER_DIR,COVERS_KEPT).await.unwrap_or_default();
+                                let details=client_api::track_info(&session,&uri).await.unwrap_or_default();
+                                sender.send_if_modified(|s|{if s.uri!=uri{return false;}s.cover_large=large;
+                                    s.album_uri=details["album_uri"].as_str().unwrap_or("").into();
+                                    s.artists=details["artists"].as_array().cloned().unwrap_or_default();
+                                    s.liked=details["liked"].as_bool().unwrap_or(false);true});
+                                // The wide artist picture comes after, so it never delays the rest.
+                                let artist=details["artists"][0]["uri"].as_str().unwrap_or("").to_owned();
+                                let background=media_api::artist_background(&session,&uri,&artist).await;
+                                sender.send_if_modified(|s|{if s.uri!=uri||s.background==background{return false;}s.background=background;true});
+                            });
+                        }
+                        show_track(&panel, &session, track_of(audio_item));
+                    }
+                    _ => {}
+                }
+                publish(&panel, |s| s.streaming = streaming_now());
+                // A play or pause from the panel that waited for the track to load.
+                if loaded {
+                    if let (Some(want), Some(spirc)) = (deferred_play.take(), spirc.as_ref()) {
+                        let playing_now = matches!(event, Some(PlayerEvent::Playing { .. }));
+                        if want != playing_now {
+                            log::info!("overlay panel: {} now that the track has loaded", if want { "play" } else { "pause" });
+                            let _ = if want { spirc.play() } else { spirc.pause() };
+                        }
+                    }
+                }
                 match event {
-                    Some(PlayerEvent::Playing { .. }) => playing = true,
-                    Some(PlayerEvent::Paused { .. } | PlayerEvent::Stopped { .. }) => playing = false,
+                    Some(PlayerEvent::Playing { .. }) => {
+                        playing = true;
+                        // Spotify is playing and nothing plays the stream file: what it
+                        // plays would go nowhere. Pause it, and say what to do.
+                        let streaming = tape.as_ref().map_or(true, |tape| tape.feed.accepting());
+                        // The PCM writer already waits for the console Service, so Spotify
+                        // is not paused while it resumes: that showed Play, Pause, Play.
+                        #[cfg(feature="usb-autostart")]
+                        if !cfg!(feature="shell-pcm") && transport::playing(streaming && transport::state()==2) {
+                            if let Some(spirc) = &spirc {
+                                if spirc.pause().is_ok() { paused_by_us = Some(PausedBy::NotRunning); }
+                            }
+                        }
+                        #[cfg(not(feature="usb-autostart"))]
+                        if let (false, Some(spirc)) = (streaming, spirc.as_ref()) {
+                            log::info!("Spotify started playing while \"Librespot Streamer\" is not playing: paused");
+                            if spirc.pause().is_ok() {
+                                paused_by_us = Some(PausedBy::NotRunning);
+                            }
+                            if let Some(notify) = notify {
+                                if told_to_open.map_or(true, |at| at.elapsed() >= OPEN_FIRST_EVERY) {
+                                    told_to_open = Some(Instant::now());
+                                    send_status(notify, OPEN_FIRST.0, OPEN_FIRST.1);
+                                }
+                            }
+                        }
+                    }
+                    Some(PlayerEvent::Paused { .. } | PlayerEvent::Stopped { .. }) => {
+                        playing = false;
+                        #[cfg(feature="usb-autostart")]
+                        transport::paused();
+                    },
+                    // The cover is fetched as soon as the track is known, a little before
+                    // it is heard, so that its notification can go out complete at once.
+                    Some(PlayerEvent::TrackChanged { audio_item }) => {
+                        if notify.is_some() {
+                            let session = session.clone();
+                            let track = track_of(&audio_item);
+                            tokio::spawn(async move {
+                                let _ = cover_file(&session, &track).await;
+                            });
+                        }
+                    }
                     Some(_) => {}
                     None => player_events = None,
                 }
@@ -533,32 +1004,89 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
                     None => std::future::pending().await,
                 }
             } => {
+                // The overlay panel switches track when the new one is heard.
+                match &notice {
+                    Some(stream::Notice::Track(track)) => show_track(&panel, &session, track.clone()),
+                    Some(stream::Notice::Restarted(Some(track)))
+                        if panel.as_ref().is_some_and(|p| p.borrow().title != track.tags.title) =>
+                    {
+                        show_track(&panel, &session, track.clone())
+                    }
+                    _ => {}
+                }
+                publish(&panel, |s| s.streaming = streaming_now());
                 match (notice, spirc.as_ref()) {
-                    (Some(stream::Notice::Paused), Some(spirc)) if playing => {
-                        paused_from_console = spirc.pause().is_ok();
-                    }
-                    (Some(stream::Notice::Resumed), Some(spirc)) if paused_from_console => {
-                        paused_from_console = false;
-                        let _ = spirc.play();
-                    }
-                    (Some(stream::Notice::Stop), Some(spirc)) => {
-                        // The stop file was played at the console.
-                        paused_from_console = false;
-                        if playing {
-                            let _ = spirc.pause();
+                    (Some(stream::Notice::Paused), spirc) => {
+                        #[cfg(feature="usb-autostart")]
+                        transport::intent(false);
+                        if let (true, Some(spirc)) = (playing, spirc) {
+                            if spirc.pause().is_ok() {
+                                paused_by_us = Some(PausedBy::Console);
+                            }
+                        }
+                        if let Some(notify) = notify {
+                            send_status(notify, "librespot-ps5 stopped", "Paused at the console");
                         }
                     }
-                    (Some(stream::Notice::Restarted(track)), _) => {
-                        // The console has just put up its own notice for the file. Ours
-                        // goes out a moment later and takes its place (same kind, and
-                        // marked to replace), so there is one notice, not two.
-                        if let Some(notify) = tape.as_ref().and_then(|tape| tape.notify) {
-                            let session = session.clone();
+                    (Some(stream::Notice::Resumed), Some(spirc)) if paused_by_us == Some(PausedBy::Console) => {
+                        paused_by_us = None;
+                        #[cfg(feature="usb-autostart")]
+                        transport::intent(true);
+                        let _ = spirc.play();
+                    }
+                    (Some(stream::Notice::Stop), spirc) => {
+                        #[cfg(feature="usb-autostart")]
+                        transport::intent(false);
+                        // The stop file was played at the console: stopped on purpose, so
+                        // Spotify does not start again by itself.
+                        paused_by_us = None;
+                        if let (true, Some(spirc)) = (playing, spirc) {
+                            let _ = spirc.pause();
+                        }
+                        if let Some(notify) = notify {
+                            send_status(notify, "librespot-ps5 stopped", "\"Stop Librespot\" was played");
+                        }
+                    }
+                    (Some(stream::Notice::Away), spirc) => {
+                        #[cfg(feature="usb-autostart")]
+                        transport::intent(false);
+                        // Other music was started at the console. Spotify waits, and goes
+                        // on when "Librespot Streamer" is played again.
+                        if let (true, Some(spirc)) = (playing, spirc) {
+                            if spirc.pause().is_ok() {
+                                paused_by_us = Some(PausedBy::NotRunning);
+                            }
+                        } else if paused_by_us.is_some() {
+                            paused_by_us = Some(PausedBy::NotRunning);
+                        }
+                        if let Some(notify) = notify {
+                            send_status(notify, "librespot-ps5 stopped", "Other music is playing");
+                        }
+                    }
+                    (Some(stream::Notice::Restarted(track)), spirc) => {
+                        // The player has started or resumed the stream file (the stream
+                        // waits until the console's own notice says it is ours). If this
+                        // program paused Spotify, it goes on now: after a resume the tape
+                        // holds it back until the silence written for the player has been
+                        // played, but the phone shows it playing straight away.
+                        #[cfg(feature="usb-autostart")]
+                        let may_resume = transport::wanted() && !transport::holding();
+                        #[cfg(not(feature="usb-autostart"))]
+                        let may_resume = true;
+                        if let (true, Some(_), Some(spirc)) = (may_resume, paused_by_us, spirc) {
+                            log::info!("\"Librespot Streamer\" is playing: Spotify goes on");
+                            paused_by_us = None;
+                            let _ = spirc.play();
+                        }
+                        if let Some(notify) = notify {
                             tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_millis(1500)).await;
+                                tokio::time::sleep(Duration::from_millis(400)).await;
                                 match track {
-                                    Some(track) => show_toast(session, track, notify).await,
-                                    None => send_toast(notify, "librespot-ps5 ready!", "by Jack (stupiditytries)", None),
+                                    Some(track) => {
+                                        let line = format!("{} - {}", track.tags.title, track.tags.artist);
+                                        send_status(notify, "librespot-ps5 started", &line)
+                                    }
+                                    None => send_status(notify, "librespot-ps5 ready!", "by Jack (stupiditytries)"),
                                 }
                             });
                         }
@@ -574,6 +1102,145 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
                 }
             }
 
+            recent = recent_contexts.recv() => {
+                if let Some(uri)=recent {
+                    library::record_context_played(&session,&uri,panel_lines.as_ref(),panel.as_ref().map_or(0,|p|p.borrow().media_session));
+                }
+            }
+
+            reported = queue_uris.recv() => {
+                if let Some((context, uris)) = reported {
+                    if current_context != context {
+                        current_context = context;
+                        publish(&panel,|s|s.context=serde_json::json!({"uri":current_context,"kind":if current_context.starts_with("spotify:album:"){"album"}else if current_context.starts_with("spotify:artist:"){"artist"}else if current_context.ends_with(":collection"){"collection"}else{"playlist"},"name":""}));
+                        let mine=current_context.clone();let panel=panel.clone();let session=session.clone();
+                        tokio::spawn(async move {
+                            if let Ok(Ok(info))=tokio::time::timeout(Duration::from_secs(8),client_api::list_info(&session,&mine)).await {
+                                publish(&panel,|s|{if s.context["uri"].as_str()==Some(mine.as_str()){s.context["name"]=info["name"].clone();}});
+                            }
+                        });
+                    }
+                    full_queue = uris.clone();
+                    let shown: Vec<String> = uris.into_iter().take(QUEUE_SHOWN).map(|track| track.uri).collect();
+                    if last_queue.as_ref() != Some(&shown) {
+                        last_queue = Some(shown.clone());
+                        let mine = queue_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                        tokio::spawn(resolve_queue(
+                            session.clone(),
+                            shown,
+                            queue_known.clone(),
+                            queue_generation.clone(),
+                            mine,
+                            panel.clone(),
+                        ));
+                    }
+                }
+            }
+
+            command = async {
+                match panel_commands.as_mut() {
+                    Some(commands) => commands.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match (command, spirc.as_ref()) {
+                    (Some(command), Some(spirc)) => {
+                        log::info!("overlay panel: {command:?}");
+                        let result = match command {
+                            // An explicit play or pause, from what librespot is doing, not a
+                            // toggle; held until a loading track is ready.
+                            control::Command::MediaFeature{feature,uri,client,id,session:epoch,generation}=>{
+                                if let (Some(panel),Some(lines))=(&panel,&panel_lines){
+                                    let state=panel.borrow();
+                                    if state.uri==uri&&state.media_session==epoch&&state.media_generation==generation {
+                                        tokio::spawn(media_features::request(session.clone(),feature,uri,client,id,epoch,generation,panel.clone(),lines.clone()));
+                                    }
+                                }Ok(())
+                            },
+                            control::Command::Pause=>spirc.pause(),
+                            control::Command::PlayList{context}=>local_start(spirc,LoadRequest::from_context_uri(context,play_options(None))),
+                            control::Command::PlayTrack{track}=>local_start(spirc,LoadRequest::from_tracks(vec![track],play_options(None))),
+                            control::Command::Search{query,id}=>{if let Some(lines)=&panel_lines {if let Some(old)=app_search.take(){old.abort();}app_search=Some(tokio::spawn(media_api::search(session.clone(),query,id,lines.clone())));}Ok(())},
+                            control::Command::Save{uri,on}=>{if let Some(lines)=&panel_lines {tokio::spawn(media_api::save(session.clone(),uri,on,lines.clone(),panel.clone()));}Ok(())},
+                            control::Command::PlayPause => {
+                                let (loading, playing_now) = panel
+                                    .as_ref()
+                                    .map_or((false, playing), |p| (p.borrow().loading, p.borrow().timeline.moving()));
+                                let want = !deferred_play.unwrap_or(playing_now);
+                                #[cfg(feature="usb-autostart")]
+                                transport::intent(want);
+                                if loading {
+                                    log::info!("overlay panel: {} once the track has loaded", if want { "play" } else { "pause" });
+                                    deferred_play = Some(want);
+                                    Ok(())
+                                } else if want {
+                                    spirc.play()
+                                } else {
+                                    spirc.pause()
+                                }
+                            }
+                            control::Command::Previous => spirc.prev(),
+                            control::Command::Next => spirc.next(),
+                            // Heard there one lead later; the panel holds until then.
+                            control::Command::Seek(ms) => spirc.set_position_ms(ms),
+                            control::Command::Volume(volume) => {
+                                spirc.set_volume((volume.min(100) * u16::MAX as u32 / 100) as u16)
+                            }
+                            control::Command::Shuffle(on) => spirc.shuffle(on),
+                            control::Command::Repeat(mode) => spirc
+                                .repeat(mode == control::Repeat::All)
+                                .and_then(|()| spirc.repeat_track(mode == control::Repeat::One)),
+                            // A queued track: within the context it came from, so what follows
+                            // it still does; without one, the queue from there on.
+                            control::Command::PlayQueued { uri, index } => {
+                                deferred_play = None;
+                                // Metadata failures can hide rows; the UI sends the original queue index.
+                                let offset = if full_queue.get(index as usize).is_some_and(|t| t.uri == uri) {
+                                    Some(index as usize)
+                                } else {
+                                    full_queue.iter().position(|t| t.uri == uri)
+                                };
+                                let selected = offset.and_then(|i| full_queue.get(i));
+                                let request = if current_context.is_empty() || selected.map_or(true, |t| t.queued) {
+                                    let offset = offset.unwrap_or(full_queue.len());
+                                    let rest: Vec<String> = full_queue.iter().skip(offset).map(|t| t.uri.clone()).collect();
+                                    let rest = if rest.first() == Some(&uri) { rest } else { vec![uri] };
+                                    LoadRequest::from_tracks(rest, play_options(None))
+                                } else {
+                                    LoadRequest::from_context_uri(current_context.clone(), play_options(Some(uri)))
+                                };
+                                local_start(spirc,request)
+                            }
+                            control::Command::Play { context, track } => {
+                                deferred_play = None;
+                                local_start(spirc,LoadRequest::from_context_uri(context, play_options(Some(track))))
+                            }
+                            control::Command::Library => {
+                                if let Some(lines) = &panel_lines {
+                                    tokio::spawn(library::send_library(session.clone(), lines.clone(),panel.as_ref().map_or(0,|p|p.borrow().media_session),false));
+                                }
+                                Ok(())
+                            }
+                            control::Command::OpenListPage { uri,offset,client,id } => {
+                                if let Some(lines)=&panel_lines {tokio::spawn(library::send_tracks_page(session.clone(),uri,offset,client,id,lines.clone(),panel.as_ref().map_or(0,|p|p.borrow().media_session)));}
+                                Ok(())
+                            }
+                            control::Command::OpenList { uri } => {
+                                if let Some(lines) = &panel_lines {
+                                    tokio::spawn(library::send_tracks(session.clone(), uri, lines.clone(),panel.as_ref().map_or(0,|p|p.borrow().media_session)));
+                                }
+                                Ok(())
+                            }
+                        };
+                        if let Err(e) = result {
+                            log::warn!("overlay panel command failed: {e}");
+                        }
+                    }
+                    (Some(command), None) => log::info!("overlay panel: {command:?} ignored; no Spotify app is connected"),
+                    (None, _) => panel_commands = None,
+                }
+            }
+
             credentials = async {
                 match discovery.as_mut() {
                     Some(d) => d.next().await,
@@ -583,9 +1250,11 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
                 match credentials {
                     Some(credentials) => {
                         log::info!("the Spotify app picked this console");
+                        publish(&panel,|s|{s.media_session=crate::native_library::millis();s.media_generation=0;});
                         last_credentials = Some(credentials);
-                        retry = MIN_RETRY;
+                        retry = MIN_RETRY;retry_at=tokio::time::Instant::now();
                         shut_down_connection(&mut spirc, &mut spirc_task, &session);
+                        publish(&panel, |s| s.connected = false);
                         connecting = true;
                     }
                     None => {
@@ -599,40 +1268,42 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
                 }
             }
 
-            _ = async {}, if connecting && last_credentials.is_some() => {
-                if session.is_invalid() {
-                    session = Session::new(session_config.clone(), cache.clone());
-                    player.set_session(session.clone());
-                }
-                let credentials = last_credentials.clone().unwrap_or_default();
-                match Spirc::new(
-                    connect_config.clone(),
-                    session.clone(),
-                    credentials,
-                    player.clone(),
-                    mixer.clone(),
-                )
-                .await
+            _ = tokio::time::sleep_until(retry_at), if connecting && last_credentials.is_some() => {
+                // A failed constructor may leave a partial session even without is_invalid().
+                session.shutdown();session=Session::new(session_config.clone(),cache.clone());player.set_session(session.clone());
+                publish(&panel,|s|{s.auth_status="connecting".into();s.auth_retry_seconds=0;});
+                let credentials=last_credentials.clone().unwrap_or_default();
+                let attempt=tokio::select!{
+                    _=stop_signal().notified()=>break,
+                    result=tokio::time::timeout(Duration::from_secs(30),Spirc::new(connect_config.clone(),session.clone(),credentials,player.clone(),mixer.clone()))=>result.unwrap_or_else(|_|Err(librespot::core::Error::deadline_exceeded("Spotify login timed out")))
+                };
+                match attempt
                 {
                     Ok((new_spirc, task)) => {
                         log::info!("connected to Spotify");
+                        last_credentials=session.reusable_credentials().or(last_credentials);
+                        publish(&panel, |s| {s.connected=true;s.auth_status="ready".into();s.auth_retry_seconds=0;
+                            s.media_session=crate::native_library::millis().max(s.media_session.saturating_add(1));s.media_generation=0;});
+                        if let Some(lines)=&panel_lines{
+                            tokio::spawn(library::send_library(session.clone(),lines.clone(),panel.as_ref().map_or(0,|p|p.borrow().media_session),true));
+                        }
                         spirc = Some(new_spirc);
                         spirc_task = Some(Box::pin(task));
                         connected_at = Some(Instant::now());
                         connecting = false;
                     }
                     Err(e) => {
-                        log::warn!("could not connect: {e}");
-                        if discovery.is_some() {
-                            // The saved login may be stale; wait for the phone to pick us.
-                            last_credentials = None;
-                            connecting = false;
-                        } else {
-                            tokio::select! {
-                                _ = stop_signal().notified() => break,
-                                _ = tokio::time::sleep(retry) => {}
-                            }
-                            retry = (retry * 2).min(MAX_RETRY);
+                        let pair=login::needs_pairing(&e);
+                        log::warn!("Spotify connection failed kind={:?} pairing_required={pair}",e.kind);
+                        session.shutdown();
+                        if pair{
+                            connecting=false;publish(&panel,|s|{s.auth_status="reauth_required".into();s.connected=false;});
+                        }else{
+                            // Timer in select leaves discovery and stop processing available.
+                            let jitter=Duration::from_millis((crate::native_library::millis()%501)as u64);
+                            retry_at=tokio::time::Instant::now()+retry+jitter;
+                            publish(&panel,|s|{s.auth_status="retrying".into();s.auth_retry_seconds=retry.as_secs();s.connected=false;});
+                            retry=(retry*2).min(MAX_RETRY);
                         }
                     }
                 }
@@ -646,15 +1317,22 @@ async fn run(settings: Settings, callbacks: ConnectCallbacks) -> i32 {
             } => {
                 spirc_task = None;
                 spirc = None;
+                #[cfg(feature="usb-autostart")]
+                transport::intent(false);
+                publish(&panel, |s| {
+                    s.connected = false;
+                    s.loading = false;
+                    let at = s.timeline.played(Instant::now());
+                    s.timeline.record(Instant::now(), at, false, false);
+                });
+                deferred_play = None;
                 if connected_at.take().map_or(false, |at| at.elapsed() >= HEALTHY) {
                     retry = MIN_RETRY;
                 }
                 if last_credentials.is_some() {
                     log::warn!("the Spotify connection ended; reconnecting in {retry:?}");
-                    tokio::select! {
-                        _ = stop_signal().notified() => break,
-                        _ = tokio::time::sleep(retry) => {}
-                    }
+                    retry_at=tokio::time::Instant::now()+retry;
+                    publish(&panel,|s|{s.auth_status="retrying".into();s.auth_retry_seconds=retry.as_secs();});
                     retry = (retry * 2).min(MAX_RETRY);
                     if !session.is_invalid() {
                         session.shutdown();
@@ -859,7 +1537,7 @@ pub extern "C" fn connect_tape_test(data_dir: *const c_char) -> c_int {
 
 #[cfg(test)]
 mod tests {
-    use super::{cover_address_allowed, cover_name};
+    use super::{cached_picture_file, cached_picture_supported, cover_address_allowed, cover_name};
     use librespot::core::cache::{seal, unseal};
 
     #[test]
@@ -888,12 +1566,41 @@ mod tests {
             Some("ab67616d00001e02abcdef.jpg")
         );
         assert_ne!(cover_name("https://i.scdn.co/image/aaa1"), cover_name("https://i.scdn.co/image/aaa2"));
+        let common="a".repeat(80);
+        assert_ne!(cover_name(&format!("https://mosaic.scdn.co/640/{common}1")),cover_name(&format!("https://mosaic.scdn.co/640/{common}2")));
+        assert_eq!(cover_name("https://i.scdn.co/image/abc?size=300"),cover_name("https://i.scdn.co/image/abc"));
+        assert!(cover_name(crate::native_library::LIKED_COVER).is_some());
+        assert!(cover_name("https://image-cdn-ak.spotifycdn.com/image/mix.jpg").is_some());
+        assert_ne!(cover_name("https://dailymix-images.scdn.co/v2/img/aaa/1/en/default"),
+                   cover_name("https://dailymix-images.scdn.co/v2/img/bbb/2/en/default"));
         // Nothing that could name a file somewhere else.
         for address in ["", "https://i.scdn.co/image/", "https://i.scdn.co/image/..", "https://i.scdn.co/image/a.b"] {
             assert_eq!(cover_name(address), None, "{address}");
         }
     }
 
+    #[test]
+    fn existing_covers_are_available_before_any_network_request() {
+        let dir=std::env::temp_dir().join(format!("cover-hit-{}",std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let folder=dir.to_str().unwrap();
+        let path=dir.join("cachetest.jpg");
+        std::fs::write(&path,[0xff,0xd8,0xff,0xd9]).unwrap();
+        assert_eq!(cached_picture_file("https://i.scdn.co/image/cachetest",folder),Some(path.to_str().unwrap().to_owned()));
+        assert!(cached_picture_file("https://example.com/image/cachetest",folder).is_none());
+        for invalid in [&b"RIFFxxxxWEBPdata"[..], &b"<html>error</html>"[..], &[0x89, b'P', b'N', b'G'][..], &[][..]] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(cached_picture_file("https://i.scdn.co/image/cachetest",folder).is_none());
+        }
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        assert!(cached_picture_file("https://i.scdn.co/image/cachetest",folder).is_some());
+        #[cfg(unix)] {
+            let link = dir.join("linked.jpg");
+            std::os::unix::fs::symlink(&path, &link).unwrap();
+            assert!(!cached_picture_supported(link.to_str().unwrap()));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn covers_come_only_from_spotify() {
         assert!(cover_address_allowed("https://i.scdn.co/image/ab67616d00001e02abcdef"));

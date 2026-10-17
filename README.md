@@ -6,140 +6,132 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status: experimental">&nbsp;
-  <img src="https://img.shields.io/badge/Tokens%20Wasted-9%20Kazillion%2B-blueviolet" alt="Tokens Wasted: 9 Kazillion+">&nbsp;
-  <img src="https://img.shields.io/badge/PS5-up%20to%20FW%2013.60-003791" alt="PS5: up to FW 13.60">&nbsp;
+  <img src="https://img.shields.io/badge/status-less%20experimental-yellow" alt="Status: less experimental">&nbsp;
+  <img src="https://img.shields.io/badge/Tokens%20Wasted-87%20Kazillion%2B-blueviolet" alt="Tokens Wasted: 87 Kazillion+">&nbsp;
+  <img src="https://img.shields.io/badge/PS5-FW%2013.20%2C%20others%20untested-003791" alt="PS5: FW 13.20, others untested">&nbsp;
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue" alt="License: GPL-3.0-or-later"></a>&nbsp;
-  <img src="https://img.shields.io/badge/built%20with-Rust%20%7C%20C-8B5A2B" alt="Built with Rust and C">
+  <img src="https://img.shields.io/badge/built%20with-Rust%20%7C%20C%2B%2B-8B5A2B" alt="Built with Rust and C++">
 </p>
 
-<p align="center">
-  <img src="docs/images/now-playing.jpg" alt="The PS5's Music card playing Librespot Streamer, with a notification for the track that has just started" width="100%">
-</p>
+<table>
+  <tr>
+    <td width="50%"><img src="docs/images/01-kabuki-lyrics.jpg" alt="Kabuki's Now Playing card with synced lyrics behind it"></td>
+    <td width="50%"><img src="docs/images/02-kabuki-in-game.jpg" alt="Kabuki's Now Playing card open over a game"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/images/03-kabuki-library.jpg" alt="Kabuki's Library card open over the librespot-ps5 app"></td>
+    <td width="50%"><img src="docs/images/04-companion-album.jpg" alt="The librespot-ps5 app showing an album's songs"></td>
+  </tr>
+</table>
 
 <hr>
 
-<h3 align="center">Spotify Connect on a modified PS5, playing over your games</h3>
+<h3 align="center">Spotify Connect on a modified PS5, playing over your games. Now without the USB stick.</h3>
+
+<p align="center"><a href="FIRMWARE-SUPPORT.md">Tested on FW 13.20, other firmware untested. Want yours supported? Read this.</a></p>
 
 <hr>
 
-librespot-ps5 turns a modified PS5 into a Spotify Connect speaker. Pick **PS5 Connect** in the Spotify app on your phone and the music plays through the console, and keeps playing while you are in a game.
+librespot-ps5 turns a modified PS5 into a Spotify Connect speaker. Pick **PS5 Connect** in the Spotify app and the music plays through the console, and keeps playing while you are in a game.
+
+v2 is a big one. The music no longer goes through a file on a USB drive, you can control it from a control centre over your game ([Kabuki](https://github.com/stupiditytries/kabuki-ps5)), and there is an app on the console for browsing your library, so after the first cast you don't need your phone at all.
 
 It is built on [librespot](https://github.com/librespot-org/librespot), the open-source Spotify client library. Like Librespot, it needs a Spotify Premium account.
 
-> **librespot-ps5 is still experimental!** While it works on my console, there are unfinished and incomplete features.
+> **librespot-ps5 is still experimental!** v2 works on my console, but it's had a lot less time on it than v1. Expect rough edges.
 
-## Download
+> **Tested on FW 13.20, other firmware untested.** To play over games, v2 reads a few values from inside the console's own music service, at positions found in the 13.20 version of it. A different firmware can move those around, so before touching anything the receiver checks that the music service matches the one it knows, and if it doesn't, it safely refuses to play instead of risking a crash. Give it a go anyway! If it doesn't work on yours, see [Firmware support](FIRMWARE-SUPPORT.md) and I should be able to fix it for everyone on that firmware.
 
-Get `librespot-ps5.elf` from the [Releases page](https://github.com/stupiditytries/librespot-ps5/releases). The release notes there have the short version of how to use it.
+## Getting started
 
-## What it does
+**Go to the [Releases page](../../releases) and download the latest `.zip`.** It has the two programs you need:
 
-- Shows up as a device in the Spotify app. You pair from the app; no password is typed on the console.
-- Plays over games, through the console's own music player, so the console's volume, mute and Music card all work as usual.
-- Play, pause, skip, seek and volume from the phone, heard about two seconds later.
-- A notification with the cover, title and artist when a track starts.
-- A **Stop Librespot** track that stops the stream when you play it.
-- The saved login is encrypted with a key from your console, and the account name is kept out of the logs.
+- `kabuki-ps5.elf`, the control centre ([Kabuki](https://github.com/stupiditytries/kabuki-ps5)).
+- `librespot-ps5.elf`, the Spotify receiver.
+
+Then:
+
+1. Put both on a USB drive (or wherever your payload loader loads from).
+2. Load **`kabuki-ps5.elf` first**, then **`librespot-ps5.elf`**. librespot-ps5 needs Kabuki running and will tell you if it isn't.
+3. In the Spotify app on your phone, open the device list and pick **PS5 Connect**. The first time, this is also what signs the console in.
+4. Hold **L3 + R3** to open Kabuki. Now Playing, Queue and Library are there, over the home screen or a game.
+
+The receiver also installs the **librespot-ps5** app (`PPSA99730`) into `/data/homebrew` the first time it runs, and keeps it up to date. Mount it the way you do your other folder apps.
+
+## What's new in v2
+
+- **No more USB.** The music goes straight to the console's audio instead of through a 12-hour FLAC file on a USB drive. No Streamer track to start, no 14 seconds of silence, no drive to keep plugged in.
+- **Controls over your game.** Kabuki's Now Playing card has play/pause, skip, volume and **scrubbing**, with cover art, plus your queue and your library. L1/R1 skip, Square pauses.
+- **A proper app on the console.** Browse your albums and playlists, open an album and play from any song, search, like songs, see what's playing.
+- **Untethered from your phone.** Cast once and the login is saved (encrypted with a key from your console). After that you can pick and play music from the app or from Kabuki without touching your phone.
+- **Scrubbing everywhere:** from Kabuki, from the app and from the phone.
+- **Synced lyrics** that follow the song. WIP: If a song has no synced lyrics it just says *Lyrics unavailable*.
+- **Canvas**, the short looping videos some songs have, plays silently behind Now Playing in the app.
+- **Song notifications** when a new track starts, with cover, title and artist.
+- **Tapping a song on the phone plays that song** (v1 sometimes jumped to the first song of the playlist), and shuffle stays how you set it.
+- Library requests are rate-limited properly, so Spotify doesn't lock you out for an hour when you scroll a lot :P
 
 ## What you need
 
-- A PS5 that can load ELF payloads.
-- [klogsrv](https://github.com/ps5-payload-dev/klogsrv) running on the console (the program reads the console's log through it).
-- A USB drive the console plays music from (exFAT or FAT32, not one formatted as extended storage), with about 8 GB free.
-- Spotify Premium, and the Spotify app on a phone on the same network as the console.
+- A PS5 that can load ELF payloads. **Tested on FW 13.20.** The audio only starts when the console's music service matches the 13.20 one it was built against, so other firmware won't play yet and needs testing.
+- Spotify Premium, and the Spotify app on a phone on the same network as the console (for the first cast).
+- A way to mount folder apps (for the librespot-ps5 app; Kabuki and the receiver work without it).
 
-## Using it
+klogsrv and a USB music drive are **not** needed any more.
 
-1. Put `librespot-ps5.elf` on a USB drive and load it with your payload loader.
-2. On the console, open the Music card, go to your USB drive, open the folder **Start Librespot** and play **Librespot Streamer**. The program makes the folder and the track the first time it runs.
-3. In the Spotify app, open the device list and pick **PS5 Connect**. The first time, this is also what signs the console in.
-4. Start a game. The music carries on.
+## Stopping and updating
 
-After pressing play on the console there are about 14 seconds of silence before the music starts. That is expected; see below.
+To replace the receiver, close the librespot-ps5 app first, then load the new `librespot-ps5.elf`; it asks the old copy to exit. Never run two receivers at once. Reopen the app afterwards so it loads its new version.
 
-To stop, open the folder **Librespot Controls** and play **Stop Librespot**, or just pause from the phone.
+The receiver keeps its files in `/data/spotifyps5`: `connect.log` is its log, and a file called `debug.txt` there turns on a detailed log for finding faults. Kabuki keeps its settings and logs in `/data/custom-overlays`.
 
 ## How it works
 
-A background program on a PS5 cannot simply play sound. Its audio output is muted by the console, and asking the console's media service to play for it crashes that service. An app can play sound, but apps are closed when a game starts.
+A background program on a PS5 can't simply play sound: its audio output is muted by the console. v1 got around that by writing the music into a file that the console's own USB music player played (see the [v1 README](https://github.com/stupiditytries/librespot-ps5/tree/v0.1.0#how-it-works) for that whole saga).
 
-The console's own USB music player has neither problem: it keeps playing over games. So this program never plays anything. It writes the music into a file on the USB drive, and the console's player plays that file.
+v2 hands the decoded audio to a small worker running inside the console's own UI process, which plays it through the same music path the console uses for its own music. That path keeps going over games, so the console's volume and mute work as usual. The worker checks the console's music service against the exact firmware it was built for before it touches anything, and refuses and cleans up if anything doesn't match.
 
 ```
-phone ── Spotify Connect ──> librespot (on the PS5)
+phone ── Spotify Connect ──> librespot-ps5 (receiver)
                                   │ decoded audio
                                   v
-                            stream writer ──> "Librespot Streamer.flac" on the USB drive
-                                  ^                        │
-                                  │ "started" / "ended"    v
-                            the console's log <── the console's USB music player
+                       worker in the console's UI ──> the console's music output
+                                  ^
+         Kabuki (L3 + R3) ────────┤ controls, queue, library
+         librespot-ps5 app ───────┘ browse, search, lyrics, Canvas
 ```
 
-**librespot-ps5 uses one long background track.** The file is an uncompressed FLAC with a stated length of 12 hours. Every Spotify track goes into it one after the other, so on the console it is a single track called Librespot Streamer.
-
-**Delay minimisation:** Left alone, the console's player reads about nine seconds ahead of what you hear, so anything written into the file is heard nine seconds late at best. The player decides how long the file is when it opens it, though. So the file is full size when the player opens it, and a moment later the program cuts it off just after the last audio it has written and lets it grow from there. The player reaches the end, finds nothing more to read, and waits. It can no longer read ahead, and the delay becomes whatever gap the program keeps, which is two seconds.
-
-That is also why there is silence at the start: the player loads the first few seconds of the file before the program is able to cut it, so those seconds have to be something harmless.
-
-**Knowing where the player is:** The console's log has a line when its player starts something and another when it ends or pauses. The program reads those lines and runs its own clock from them. The log never says which file, so a few things are worked out from timing: the Stop track is recognised by its length, for example.
-
-**Things the console's player is fussy about**, learned the hard way from crashes and silence :P :
-
-- Uncompressed audio contains its own sample values as raw bytes, and two common values in quiet music are the same two bytes that mark the start of a FLAC frame. The console's player takes the first such pair it finds after seeking as genuine, and crashes. The writer nudges those samples by one step so the pair never appears inside the audio.
-- When you pause on the console and resume, the player opens the file again and finds its place from the file's size. So on a pause the file is put back to full size, and cut off again once the player is going.
-- Music that has been played is replaced with silence a few seconds later, so the file never holds more than a few seconds of audio.
-
-**Pairing.** The program announces itself on the network the way any Spotify speaker does. Picking it in the app hands it a login for your account, encrypted with an identifier of the console. This information never goes anywhere besides to Spotify.
-
-## Settings
-
-The program keeps its files in `/data/spotifyps5`. `tape.txt` there holds the settings and is written with the defaults the first time:
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `lead` | `2` | Seconds of audio kept written ahead of what is heard. This is the delay. |
-| `idle` | `600` | Seconds without audio after which nothing more is written to the drive until music returns. |
-| `hours` | `12` | Length of the stream file. One hour is about 635 MB. |
-| `toast` | `1` | Show a notification when a track starts. |
-| `toast_style` | `0` | Which kind of console notification is used: `0` is the console's own small music notice. |
-
-A file called `debug.txt` in the same folder turns on a detailed log, for finding faults.
-
-## Not finished
-
-- **Pausing from the console** works by a workaround and has a cost: about 14 seconds of silence when you resume. Pausing from the phone has none.
-- **Next and Previous on the console** do nothing useful. Use the phone.
-- After 12 hours the stream file is full and has to be started again.
-- Only tested on one console and one drive.
-- No cover art/metadata on the console's Music card; the console does not show covers for USB music and I couldn't find a way to get this reliably working without registry edits.
+The app only draws and sends commands. Spotify, the login, the caches and the audio all stay in the receiver.
 
 ## Building
 
-The receiver is a Rust library (`connect`) linked into a small C program (`connectd`), built with the [PS5 Payload SDK](https://github.com/ps5-payload-dev/sdk) on Linux or WSL:
+Everything is built with the [PS5 Payload SDK](https://github.com/ps5-payload-dev/sdk) on Linux or WSL. GitHub Actions builds the release from this repository on every tag; `tools/ci/` has the exact steps and pinned versions, and they work locally too:
 
 ```bash
-bash connectd/build.sh
+bash tools/ci/setup-deps.sh "$HOME/librespot-ps5-deps"
+source "$HOME/librespot-ps5-deps/env.sh"
+bash tools/ci/build-release.sh
 ```
 
-The script's header lists what it expects to find. The tests for the stream writer run on any PC and need nothing from the console:
+That runs the tests, builds the app (`player/`), embeds it in the receiver and leaves `dist/librespot-ps5.elf`. The pieces:
 
-```bash
-cd connect && cargo test --release --lib
-```
-
-They run the writer against a pretend console player that follows what the real one was seen to do.
+- `connect/`: the Rust receiver library (librespot, Kabuki provider, library, search, lyrics, Canvas).
+- `connectd/modular/`: the receiver program and the audio transport.
+- `player/`: the librespot-ps5 app (Borealis).
+- `vendor/`: patched copies of librespot's core and Connect crates, and the ShellUI loader.
 
 ## Credits
 
 - [librespot](https://github.com/librespot-org/librespot), which does all the Spotify work. Big thank you to the contributors for making an awesome project! :)
-- The [PS5 Payload SDK](https://github.com/ps5-payload-dev/sdk) and [klogsrv](https://github.com/ps5-payload-dev/klogsrv) from the ps5-payload-dev project.
+- The [PS5 Payload SDK](https://github.com/ps5-payload-dev/sdk) from the ps5-payload-dev project.
+- [ps5-native-app-boilerplate](https://github.com/blackbearreloaded/ps5-native-app-boilerplate) and the [PS5 OpenGL SDK](https://github.com/blackbearreloaded/ps5-opengl) by BlackBearReloaded, which the app is built with.
+- [Borealis](https://github.com/xfangfang/borealis) for the app's UI and [FFmpeg](https://ffmpeg.org) for Canvas videos.
 
 ## License
 
 librespot-ps5 is free software under the [GNU General Public License, version 3 or later](LICENSE). The program is linked with the PS5 Payload SDK, which is under the same licence.
 
-`vendor/librespot-core` is a copy of librespot's core crate with two changes (audio keys are asked for again when a request times out, and the saved login is encrypted). librespot is under the MIT licence, which is in that folder.
+`vendor/librespot-core` and `vendor/librespot-connect` are copies of librespot's crates with changes for the console; librespot is under the MIT licence, which is in those folders. The licences for the app's fonts and FFmpeg are in `player/assets/fonts` and installed with the app.
 
 ## Disclaimer
 

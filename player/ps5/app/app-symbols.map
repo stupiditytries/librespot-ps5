@@ -1,0 +1,9 @@
+/*
+ * The app exports nothing. Without this, the linker exports every function the app defines
+ * that a console module also defines (the stand-ins in src/compat_modules.c), and the
+ * packaging tool rejects an executable with exports.
+ */
+{
+    local:
+        *;
+};

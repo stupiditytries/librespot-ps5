@@ -17,6 +17,13 @@
 //! - a start in the middle of the stream is the stream file being started again from its
 //!   beginning (previous or next at the console, in a folder with one entry).
 //!
+//! What does tell the files apart is the notice the console puts up when its player starts
+//! a track: the log gives its size, which depends on the track, so the stream file's is
+//! known (`Config::stream_notice`). Any other size right after a start means other music:
+//! the stream stops and the file is made ready to be started from its beginning again. The
+//! console does not always put up a notice on a resume; with none, the start is taken to
+//! be ours, as before.
+//!
 //! Nothing here touches the disk or the clock directly: the files are behind [`Store`] and
 //! the time is passed in, so it runs against a pretend player in the tests.
 
@@ -55,6 +62,9 @@ pub struct Config {
     /// Whether the file states its length. Without it the console's player crashed when
     /// it opened the file a second time (2026-10-11), so this stays on.
     pub show_length: bool,
+    /// Size of the console's own notice for the stream file, as its log gives it (813 on
+    /// 2026-10-11 and 2026-10-14, with a 12-hour file). See the top of the file.
+    pub stream_notice: u32,
     /// Once the player has opened the file, cut the file off just after what has been
     /// written and let it grow as audio arrives. The player took the file's full
     /// size when it opened it, so it should not take the end of the file for the end of
@@ -72,6 +82,7 @@ impl Default for Config {
             idle_limit: 600.0,
             hours: 12.0,
             show_length: true,
+            stream_notice: 813,
             grow: true,
         }
     }
@@ -90,8 +101,12 @@ pub enum Notice {
     /// The player has just started the stream file, or gone on with it after a pause. The
     /// console shows a notice of its own for the file at that moment ("Librespot
     /// Streamer"); this is the cue to put ours in its place: the track that is on, if
-    /// there is one.
+    /// there is one. Sent once the console's notice has been seen, or a moment after the
+    /// start if it does not come.
     Restarted(Option<Track>),
+    /// Other music was started in the console's player: the stream has stopped, and the
+    /// file is ready to be started again.
+    Away,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -159,6 +174,17 @@ const MARK: &[u8; 4] = b"LSDE";
 const MARK_STEP: u64 = 4 << 20;
 /// Frames written in one call at most.
 const FRAMES_PER_TICK: usize = 400;
+/// The console's notice for a track follows the start by well under a second; one later
+/// than this is not taken to be about that start.
+const IDENTIFY_WINDOW: f64 = 3.0;
+/// How long [`Notice::Restarted`] waits for the console's notice before it goes anyway.
+const HOLD_LIMIT: f64 = 2.5;
+/// Notices of the console's this size and up are for a track its player started; smaller
+/// ones are other things (and ours are left out before they get here).
+const TRACK_NOTICE_MIN: u32 = 600;
+/// After other music has been seen to start, the stream stops this much later, so that
+/// the stop file (which also counts as other music) is recognised first.
+const AWAY_DELAY: f64 = 4.5;
 /// The shortest stream file worth having, in hours.
 const SHORTEST_HOURS: f64 = 0.5;
 
@@ -223,6 +249,15 @@ pub struct Stream {
     told_spotify: bool,
     /// The tape is to be lined up with the player at the next resume.
     resync: bool,
+    /// A notice kept back until the console has said what its player started.
+    held: Option<(f64, Notice)>,
+    /// Until when the console's next notice is taken to be about the last start.
+    identify_until: Option<f64>,
+    /// Other music has started; the stream stops at this time.
+    away_at: Option<f64>,
+    /// The stream file has been seen playing since it was last made ready. Until then a
+    /// start may have been other music all along, and stopping for it is not news.
+    confirmed: bool,
     /// With a growing file: nothing has arrived for the idle time, so silence is no longer
     /// written to keep ahead of the player.
     starved: bool,
@@ -280,6 +315,10 @@ impl Stream {
             last_short_end: None,
             told_spotify: false,
             resync: false,
+            held: None,
+            identify_until: None,
+            away_at: None,
+            confirmed: false,
             starved: false,
         };
         log::info!("stream file: {:.1} hours, {} MB", hours, length >> 20);
@@ -325,6 +364,9 @@ impl Stream {
         self.wiped_to = 0;
         self.resync = false;
         self.told_spotify = false;
+        self.held = None;
+        self.away_at = None;
+        self.confirmed = false;
         self.rewind()?;
         self.full_logged = false;
         self.player = Player::Waiting;
@@ -414,9 +456,15 @@ impl Stream {
     }
 
     fn on_signal(&mut self, now: f64, signal: Signal, notices: &mut Vec<Notice>) {
+        if let Signal::Notice(size) = signal {
+            self.on_console_notice(now, size, notices);
+            return;
+        }
         if signal == Signal::End && self.stop_file_played(now) {
             log::info!("\"{STOP_TITLE}\" was played: the stream stops");
             self.short_plays = 0;
+            self.away_at = None;
+            self.held = None;
             // The player plays the stop file round and round; with nothing in it, it
             // stops. It is put back when the stream is made ready.
             let silence = vec![0u8; stop_file().len() - AUDIO_START as usize];
@@ -445,7 +493,7 @@ impl Stream {
                 log::info!("the player has started: the stream is running");
                 self.player = Player::Playing { t0: now };
                 self.last_audio = now;
-                notices.push(Notice::Restarted(None));
+                self.hold(now, Notice::Restarted(None));
             }
             (Player::Playing { t0 }, Signal::Start) if now - t0 < START_SETTLE => {
                 self.player = Player::Playing { t0: now };
@@ -509,10 +557,85 @@ impl Stream {
             }
             (_, Signal::End) => {}
             (_, Signal::Crashed) => {}
+            (_, Signal::Notice(_)) => {}
         }
         if signal == Signal::Start {
             self.last_start = Some(now);
+            self.identify_until = Some(now + IDENTIFY_WINDOW);
         }
+    }
+
+    /// Keeps `notice` back until the console says what was started (see the top of the
+    /// file). A later one takes the place of an earlier one.
+    fn hold(&mut self, now: f64, notice: Notice) {
+        self.held = Some((now, notice));
+    }
+
+    /// The console has put up a notice of `size` bytes.
+    fn on_console_notice(&mut self, now: f64, size: u32, notices: &mut Vec<Notice>) {
+        if !self.identify_until.is_some_and(|until| now <= until) {
+            log::debug!("a notice from the console ({size}) with no start just before it");
+            return;
+        }
+        if size == self.config.stream_notice {
+            self.identify_until = None;
+            log::debug!("the console's notice is for \"{STREAM_TITLE}\"");
+            let returning = self.away_at.take().is_some();
+            self.confirmed = true;
+            if returning {
+                // Other music played in between, and now the stream file again: the player
+                // starts it from its beginning, which is where the file is made ready.
+                log::info!("\"{STREAM_TITLE}\" was started again after other music");
+                let start = self.last_start.unwrap_or(now);
+                if let Err(e) = self.leave() {
+                    log::error!("writing to the stream file failed: {e}; the stream stops");
+                    self.halt();
+                    self.player = Player::Draining { quiet_since: now };
+                    return;
+                }
+                self.player = Player::Playing { t0: start };
+                self.last_audio = now;
+                self.confirmed = true;
+                notices.push(Notice::Restarted(None));
+                return;
+            }
+            if let Some((_, notice)) = self.held.take() {
+                notices.push(notice);
+            }
+        } else if size >= TRACK_NOTICE_MIN {
+            self.identify_until = None;
+            log::info!(
+                "the console's player started other music (its notice: {size} bytes, \"{STREAM_TITLE}\" has {})",
+                self.config.stream_notice
+            );
+            self.held = None;
+            if !matches!(self.player, Player::Draining { .. }) {
+                self.away_at = Some(now + AWAY_DELAY);
+            }
+        }
+    }
+
+    /// Other music is playing: stops the stream and gets the file ready to be started from
+    /// its beginning, as at a first start.
+    fn away(&mut self, notices: &mut Vec<Notice>) -> io::Result<()> {
+        if matches!(self.player, Player::Waiting | Player::Draining { .. }) {
+            return Ok(());
+        }
+        let was_playing = self.confirmed;
+        self.leave()?;
+        if was_playing {
+            log::info!("other music is playing: the stream stops until \"{STREAM_TITLE}\" is played again");
+            notices.push(Notice::Away);
+        }
+        Ok(())
+    }
+
+    /// Clears what was played from the file and gets it ready to be started.
+    fn leave(&mut self) -> io::Result<()> {
+        if self.config.grow {
+            self.silence_behind(self.write_frames)?;
+        }
+        self.arm()
     }
 
     /// The player has paused (or ended) with a growing file. When it resumes it opens the
@@ -546,9 +669,9 @@ impl Stream {
     fn resume(&mut self, now: f64, at: u64, notices: &mut Vec<Notice>) {
         self.player = Player::Playing { t0: now - at as f64 / RATE as f64 };
         self.last_audio = now;
-        // The console announces the file again; ours for the track goes over it now, and
-        // is not sent a second time when the track's audio follows.
-        notices.push(Notice::Restarted(self.current.clone()));
+        // The console announces the file again; ours for the track goes over it, and is
+        // not sent a second time when the track's audio follows.
+        self.hold(now, Notice::Restarted(self.current.clone()));
         self.announced_at = self.written();
         if self.config.grow {
             // Spotify is told when the tape is about to need its audio again (see
@@ -589,11 +712,26 @@ impl Stream {
 
     /// Changes of state that come from time passing.
     fn advance(&mut self, now: f64, notices: &mut Vec<Notice>) -> io::Result<()> {
+        if self.held.as_ref().is_some_and(|(since, _)| now - since > HOLD_LIMIT) {
+            // The console put up no notice: the start is taken to be the stream file's.
+            let (_, notice) = self.held.take().unwrap();
+            self.confirmed = true;
+            notices.push(notice);
+        }
+        if self.away_at.is_some_and(|at| now >= at) {
+            self.away_at = None;
+            self.away(notices)?;
+        }
         match self.player {
             Player::Playing { t0 } => {
                 let elapsed = ((now - t0).max(0.0) * RATE as f64) as u64;
                 let settled = self.last_start.map_or(true, |start| now - start > START_SETTLE + 0.5);
-                if self.config.grow && !self.grown && !self.halted && settled && now - t0 > START_SETTLE + 0.5 {
+                // Not once other music has been seen to start: the file must be whole
+                // when the stream file is started again. (Not held back until the
+                // console's notice either: with the file whole the player reads further
+                // ahead, into silence, and audio written there later goes unheard.)
+                let known = self.away_at.is_none();
+                if self.config.grow && !self.grown && !self.halted && settled && known && now - t0 > START_SETTLE + 0.5 {
                     // The player has the file open and has read some way into the silence
                     // at its start. From here on the file ends where the audio ends.
                     self.store.set_len(STREAM, flac::frame_offset(self.write_frames))?;
@@ -861,6 +999,15 @@ impl Stream {
         );
         self.feed.set_accepting(!self.halted && running && self.write_frames < self.capacity);
         notices
+    }
+
+    /// Re-arm only after the native USB worker has confirmed Stop.
+    #[cfg(feature="usb-autostart")]
+    pub fn prepare_native_start(&mut self) -> io::Result<()> {
+        self.last_start = None;
+        self.last_short_end = None;
+        self.short_plays = 0;
+        self.leave()
     }
 
     /// One line on where the stream is, for the log.
